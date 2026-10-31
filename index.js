@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { connectDB } from "./db.js";
-
+import { ObjectId } from "mongodb";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -31,6 +31,7 @@ app.get("/api/studios", async (req, res) => {
     });
   }
 });
+//get data from mongodb 
 app.get("/api/featured-studios", async (req, res) => {
   try {
     const studios = await db
@@ -46,6 +47,42 @@ app.get("/api/featured-studios", async (req, res) => {
 
     res.status(500).json({
       message: "Failed to fetch featured studios",
+    });
+  }
+});
+//Details page api with create id
+app.get("/api/studios/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log("Requested Studio ID:", id);
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid studio ID",
+      });
+    }
+
+    const studio = await db.collection("studios").findOne({
+      _id: new ObjectId(id),
+    });
+
+    console.log("Studio found:", studio);
+
+    if (!studio) {
+      return res.status(404).json({
+        message: "Studio not found",
+      });
+    }
+
+    res.status(200).json(studio);
+
+  } catch (error) {
+    console.error("Get studio details error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch studio details",
+      error: error.message,
     });
   }
 });
