@@ -1,8 +1,10 @@
+
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { connectDB } from "./db.js";
 import { ObjectId } from "mongodb";
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -11,12 +13,18 @@ app.use(express.json());
 
 let db;
 
-// Test route
+// ======================================
+// 1. Test Route
+// ======================================
+
 app.get("/", (req, res) => {
   res.send("StudioSpace Server is Running!");
 });
 
-// Get all studios
+// ======================================
+// 2. Get All Studios
+// ======================================
+
 app.get("/api/studios", async (req, res) => {
   try {
     const studios = await db
@@ -26,12 +34,18 @@ app.get("/api/studios", async (req, res) => {
 
     res.status(200).json(studios);
   } catch (error) {
+    console.error("Get studios error:", error);
+
     res.status(500).json({
       message: "Failed to fetch studios",
     });
   }
 });
-//get data from mongodb 
+
+// ======================================
+// 3. Get Featured Studios
+// ======================================
+
 app.get("/api/featured-studios", async (req, res) => {
   try {
     const studios = await db
@@ -50,12 +64,14 @@ app.get("/api/featured-studios", async (req, res) => {
     });
   }
 });
-//Details page api with create id
+
+// ======================================
+// 4. Get Single Studio Details
+// ======================================
+
 app.get("/api/studios/:id", async (req, res) => {
   try {
     const { id } = req.params;
-
-    console.log("Requested Studio ID:", id);
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -67,8 +83,6 @@ app.get("/api/studios/:id", async (req, res) => {
       _id: new ObjectId(id),
     });
 
-    console.log("Studio found:", studio);
-
     if (!studio) {
       return res.status(404).json({
         message: "Studio not found",
@@ -76,19 +90,19 @@ app.get("/api/studios/:id", async (req, res) => {
     }
 
     res.status(200).json(studio);
-
   } catch (error) {
     console.error("Get studio details error:", error);
 
     res.status(500).json({
       message: "Failed to fetch studio details",
-      error: error.message,
     });
   }
 });
 
+// ======================================
+// 5. Add New Studio
+// ======================================
 
-// Add a new studio
 app.post("/api/studios", async (req, res) => {
   try {
     const studio = req.body;
@@ -99,25 +113,28 @@ app.post("/api/studios", async (req, res) => {
       });
     }
 
-    const result = await db
-      .collection("studios")
-      .insertOne({
-        ...studio,
-        createdAt: new Date(),
-      });
+    const result = await db.collection("studios").insertOne({
+      ...studio,
+      createdAt: new Date(),
+    });
 
     res.status(201).json({
       message: "Studio created successfully",
       insertedId: result.insertedId,
     });
   } catch (error) {
+    console.error("Add studio error:", error);
+
     res.status(500).json({
       message: "Failed to create studio",
     });
   }
 });
 
-// Create a new booking
+// ======================================
+// 6. Create New Booking (POST)
+// ======================================
+
 app.post("/api/bookings", async (req, res) => {
   try {
     const {
@@ -130,11 +147,13 @@ app.post("/api/bookings", async (req, res) => {
       guests,
     } = req.body;
 
-    // 1. Validate required fields
+    // Validate required fields
     if (
       !studioId ||
-      !customerName?.trim() ||
-      !customerEmail?.trim() ||
+      typeof customerName !== "string" ||
+      !customerName.trim() ||
+      typeof customerEmail !== "string" ||
+      !customerEmail.trim() ||
       !bookingDate ||
       !startTime ||
       !endTime ||
@@ -145,18 +164,22 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // 2. Validate Studio ID
+    // Validate Studio ID
     if (!ObjectId.isValid(studioId)) {
       return res.status(400).json({
         message: "Invalid studio ID.",
       });
     }
 
-    // 3. Validate date and time formats
-    const validDate = /^\d{4}-\d{2}-\d{2}$/.test(bookingDate);
+    // Validate date and time
+    const validDate = /^\d{4}-\d{2}-\d{2}$/;
     const validTime = /^([01]\d|2[0-3]):[0-5]\d$/;
 
-    if (!validDate || !validTime.test(startTime) || !validTime.test(endTime)) {
+    if (
+      !validDate.test(bookingDate) ||
+      !validTime.test(startTime) ||
+      !validTime.test(endTime)
+    ) {
       return res.status(400).json({
         message: "Invalid booking date or time.",
       });
@@ -173,7 +196,86 @@ app.post("/api/bookings", async (req, res) => {
         message: "Guest number must be at least 1.",
       });
     }
-// Get bookings for a specific customer
+
+    // Find Studio
+    const studio = await db.collection("studios").findOne({
+      _id: new ObjectId(studioId),
+    });
+
+    if (!studio) {
+      return res.status(404).json({
+        message: "Studio not found.",
+      });
+    }
+
+    if (guests > Number(studio.maxCapacity)) {
+      return res.status(400).json({
+        message: `Maximum capacity is ${studio.maxCapacity} people.`,
+      });
+    }
+
+    // Calculate duration and price
+    const [startHour, startMinute] = startTime.split(":").map(Number);
+    const [endHour, endMinute] = endTime.split(":").map(Number);
+
+    const startMinutes = startHour * 60 + startMinute;
+    const endMinutes = endHour * 60 + endMinute;
+
+    const totalHours = (endMinutes - startMinutes) / 60;
+    const totalPrice = totalHours * Number(studio.hourlyRate);
+
+    // Check overlapping bookings
+    const overlappingBooking = await db.collection("bookings").findOne({
+      studioId,
+      bookingDate,
+      status: { $ne: "Cancelled" },
+      startTime: { $lt: endTime },
+      endTime: { $gt: startTime },
+    });
+
+    if (overlappingBooking) {
+      return res.status(409).json({
+        message: "This studio is already booked during that time.",
+      });
+    }
+
+    // Save booking
+    const bookingData = {
+      studioId,
+      studioTitle: studio.title,
+      customerName: customerName.trim(),
+      customerEmail: customerEmail.trim().toLowerCase(),
+      bookingDate,
+      startTime,
+      endTime,
+      guests,
+      totalHours,
+      hourlyRate: Number(studio.hourlyRate),
+      totalPrice,
+      status: "Pending",
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("bookings").insertOne(bookingData);
+
+    res.status(201).json({
+      message: "Booking request submitted successfully!",
+      bookingId: result.insertedId,
+      booking: bookingData,
+    });
+  } catch (error) {
+    console.error("Create booking error:", error);
+
+    res.status(500).json({
+      message: "Failed to create booking.",
+    });
+  }
+});
+
+// ======================================
+// 7. Get My Bookings (GET)
+// ======================================
+
 app.get("/api/my-bookings", async (req, res) => {
   try {
     const { email } = req.query;
@@ -201,83 +303,65 @@ app.get("/api/my-bookings", async (req, res) => {
     });
   }
 });
-    // 4. Find the Studio
-    const studio = await db.collection("studios").findOne({
-      _id: new ObjectId(studioId),
-    });
 
-    if (!studio) {
-      return res.status(404).json({
-        message: "Studio not found.",
-      });
-    }
+// ======================================
+// 8. Cancel Pending Booking (PATCH)
+// ======================================
 
-    if (guests > Number(studio.maxCapacity)) {
+app.patch("/api/bookings/:id/cancel", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { email } = req.body;
+
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({
-        message: `Maximum capacity is ${studio.maxCapacity} people.`,
+        message: "Invalid booking ID.",
       });
     }
 
-    // 5. Calculate booking duration and price
-    const [startHour, startMinute] = startTime.split(":").map(Number);
-    const [endHour, endMinute] = endTime.split(":").map(Number);
-
-    const startMinutes = startHour * 60 + startMinute;
-    const endMinutes = endHour * 60 + endMinute;
-
-    const totalHours = (endMinutes - startMinutes) / 60;
-    const totalPrice = totalHours * Number(studio.hourlyRate);
-
-    // 6. Check overlapping bookings
-    const overlappingBooking = await db.collection("bookings").findOne({
-      studioId,
-      bookingDate,
-      status: { $nin: ["Cancelled"] },
-      startTime: { $lt: endTime },
-      endTime: { $gt: startTime },
-    });
-
-    if (overlappingBooking) {
-      return res.status(409).json({
-        message: "This studio is already booked during that time.",
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({
+        message: "Customer email is required.",
       });
     }
 
-    // 7. Save booking in MongoDB
-    const bookingData = {
-      studioId,
-      studioTitle: studio.title,
-      customerName: customerName.trim(),
-      customerEmail: customerEmail.trim().toLowerCase(),
-      bookingDate,
-      startTime,
-      endTime,
-      guests,
-      totalHours,
-      hourlyRate: Number(studio.hourlyRate),
-      totalPrice,
-      status: "Pending",
-      createdAt: new Date(),
-    };
+    const result = await db.collection("bookings").updateOne(
+      {
+        _id: new ObjectId(id),
+        customerEmail: email.trim().toLowerCase(),
+        status: "Pending",
+      },
+      {
+        $set: {
+          status: "Cancelled",
+          updatedAt: new Date(),
+        },
+      }
+    );
 
-    const result = await db.collection("bookings").insertOne(bookingData);
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message:
+          "Booking not found, or booking cannot be cancelled.",
+      });
+    }
 
-    // 8. Send response
-    res.status(201).json({
-      message: "Booking request submitted successfully!",
-      bookingId: result.insertedId,
-      booking: bookingData,
+    res.status(200).json({
+      message: "Booking cancelled successfully!",
     });
   } catch (error) {
-    console.error("Create booking error:", error);
+    console.error("Cancel booking error:", error);
 
     res.status(500).json({
-      message: "Failed to create booking.",
+      message: "Failed to cancel booking.",
     });
   }
 });
 
-// Start server after connecting to MongoDB
+// ======================================
+// 9. Start Server
+// ======================================
+
 async function startServer() {
   try {
     db = await connectDB();
