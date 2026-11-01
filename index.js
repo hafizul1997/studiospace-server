@@ -117,6 +117,166 @@ app.post("/api/studios", async (req, res) => {
   }
 });
 
+// Create a new booking
+app.post("/api/bookings", async (req, res) => {
+  try {
+    const {
+      studioId,
+      customerName,
+      customerEmail,
+      bookingDate,
+      startTime,
+      endTime,
+      guests,
+    } = req.body;
+
+    // 1. Validate required fields
+    if (
+      !studioId ||
+      !customerName?.trim() ||
+      !customerEmail?.trim() ||
+      !bookingDate ||
+      !startTime ||
+      !endTime ||
+      guests === undefined
+    ) {
+      return res.status(400).json({
+        message: "Please provide all required booking information.",
+      });
+    }
+
+    // 2. Validate Studio ID
+    if (!ObjectId.isValid(studioId)) {
+      return res.status(400).json({
+        message: "Invalid studio ID.",
+      });
+    }
+
+    // 3. Validate date and time formats
+    const validDate = /^\d{4}-\d{2}-\d{2}$/.test(bookingDate);
+    const validTime = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+    if (!validDate || !validTime.test(startTime) || !validTime.test(endTime)) {
+      return res.status(400).json({
+        message: "Invalid booking date or time.",
+      });
+    }
+
+    if (startTime >= endTime) {
+      return res.status(400).json({
+        message: "End time must be later than start time.",
+      });
+    }
+
+    if (!Number.isInteger(guests) || guests < 1) {
+      return res.status(400).json({
+        message: "Guest number must be at least 1.",
+      });
+    }
+// Get bookings for a specific customer
+app.get("/api/my-bookings", async (req, res) => {
+  try {
+    const { email } = req.query;
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({
+        message: "Customer email is required.",
+      });
+    }
+
+    const bookings = await db
+      .collection("bookings")
+      .find({
+        customerEmail: email.trim().toLowerCase(),
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(bookings);
+  } catch (error) {
+    console.error("My bookings error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch bookings.",
+    });
+  }
+});
+    // 4. Find the Studio
+    const studio = await db.collection("studios").findOne({
+      _id: new ObjectId(studioId),
+    });
+
+    if (!studio) {
+      return res.status(404).json({
+        message: "Studio not found.",
+      });
+    }
+
+    if (guests > Number(studio.maxCapacity)) {
+      return res.status(400).json({
+        message: `Maximum capacity is ${studio.maxCapacity} people.`,
+      });
+    }
+
+    // 5. Calculate booking duration and price
+    const [startHour, startMinute] = startTime.split(":").map(Number);
+    const [endHour, endMinute] = endTime.split(":").map(Number);
+
+    const startMinutes = startHour * 60 + startMinute;
+    const endMinutes = endHour * 60 + endMinute;
+
+    const totalHours = (endMinutes - startMinutes) / 60;
+    const totalPrice = totalHours * Number(studio.hourlyRate);
+
+    // 6. Check overlapping bookings
+    const overlappingBooking = await db.collection("bookings").findOne({
+      studioId,
+      bookingDate,
+      status: { $nin: ["Cancelled"] },
+      startTime: { $lt: endTime },
+      endTime: { $gt: startTime },
+    });
+
+    if (overlappingBooking) {
+      return res.status(409).json({
+        message: "This studio is already booked during that time.",
+      });
+    }
+
+    // 7. Save booking in MongoDB
+    const bookingData = {
+      studioId,
+      studioTitle: studio.title,
+      customerName: customerName.trim(),
+      customerEmail: customerEmail.trim().toLowerCase(),
+      bookingDate,
+      startTime,
+      endTime,
+      guests,
+      totalHours,
+      hourlyRate: Number(studio.hourlyRate),
+      totalPrice,
+      status: "Pending",
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("bookings").insertOne(bookingData);
+
+    // 8. Send response
+    res.status(201).json({
+      message: "Booking request submitted successfully!",
+      bookingId: result.insertedId,
+      booking: bookingData,
+    });
+  } catch (error) {
+    console.error("Create booking error:", error);
+
+    res.status(500).json({
+      message: "Failed to create booking.",
+    });
+  }
+});
+
 // Start server after connecting to MongoDB
 async function startServer() {
   try {
