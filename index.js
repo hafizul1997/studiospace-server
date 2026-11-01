@@ -357,7 +357,34 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
     });
   }
 });
+// Get studios added by a specific owner
+app.get("/api/my-listings", async (req, res) => {
+  try {
+    const email = req.query.email;
 
+    if (!email) {
+      return res.status(400).json({
+        message: "Owner email is required",
+      });
+    }
+
+    const studios = await db
+      .collection("studios")
+      .find({
+        ownerEmail: email.toLowerCase().trim(),
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(studios);
+  } catch (error) {
+    console.error("My listings error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch your listings",
+    });
+  }
+});
 // ======================================
 // 9. Start Server
 // ======================================
