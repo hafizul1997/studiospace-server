@@ -4,27 +4,59 @@ import cors from "cors";
 import "dotenv/config";
 import { connectDB } from "./db.js";
 import { ObjectId } from "mongodb";
+import { randomUUID } from "node:crypto";
 import { auth } from "./auth.js";
 import { fromNodeHeaders } from "better-auth/node";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+
+app.disable("x-powered-by");
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin: CLIENT_URL,
     credentials: true,
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// Better Auth already runs in Next.js.
-// Express only verifies its existing session.
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 let db;
 
 // ======================================
-// 1. Authentication Middleware
+// 1. Constants
+// ======================================
+
+const STUDIO_CATEGORIES = [
+  "Photography Studio",
+  "Music Studio",
+  "Podcast Studio",
+  "Video Studio",
+  "Event Space",
+  "Creative Workspace",
+  "Other",
+];
+
+const BOOKING_STATUSES = [
+  "Pending",
+  "Confirmed",
+  "Rejected",
+  "Cancelled",
+];
+
+const MAX_TITLE_LENGTH = 120;
+const MAX_DESCRIPTION_LENGTH = 3000;
+const MAX_LOCATION_LENGTH = 200;
+const MAX_AMENITIES = 30;
+const MAX_AMENITY_LENGTH = 60;
+
+// ======================================
+// 2. Authentication Middleware
 // ======================================
 
 const requireAuth = async (req, res, next) => {
@@ -33,7 +65,7 @@ const requireAuth = async (req, res, next) => {
       headers: fromNodeHeaders(req.headers),
     });
 
-    if (!session || !session.user) {
+    if (!session?.user || !session?.user?.email) {
       return res.status(401).json({
         success: false,
         message: "Unauthorized. Please login first.",
@@ -43,9 +75,9 @@ const requireAuth = async (req, res, next) => {
     req.user = session.user;
     req.session = session.session;
 
-    next();
+    return next();
   } catch (error) {
-    console.error("Session verification error:", error);
+    console.error("Session verification error:", error.message);
 
     return res.status(401).json({
       success: false,
@@ -55,17 +87,78 @@ const requireAuth = async (req, res, next) => {
 };
 
 // ======================================
-// 2. Helper Functions
+// 3. Helper Functions
 // ======================================
 
-const normalizeEmail = (email) => {
-  if (typeof email !== "string") return "";
-  return email.trim().toLowerCase();
+const normalizeEmail = (email) =>
+  typeof email === "string" ? email.trim().toLowerCase() : "";
+
+const getUserEmail = (req) => normalizeEmail(req.user?.email);
+
+const isValidObjectId = (id) =>
+  typeof id === "string" && ObjectId.isValid(id);
+
+const isValidString = (value, maxLength) =>
+  typeof value === "string" &&
+  value.trim().length > 0 &&
+  value.trim().length <= maxLength;
+
+const isValidDate = (value) => {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
+  }
+
+  const date = new Date(`${value}T00:00:00.000Z`);
+
+  return (
+    !Number.isNaN(date.getTime()) &&
+    date.toISOString().slice(0, 10) === value
+  );
 };
 
-const getUserEmail = (req) => {
-  return normalizeEmail(req.user?.email);
+const isValidTime = (value) =>
+  typeof value === "string" &&
+  /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+
+const isValidImageUrl = (value) => {
+  if (typeof value !== "string" || value.length > 2048) {
+    return false;
+  }
+
+  try {
+    const url = new URL(value);
+
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
 };
+
+const parsePositiveNumber = (value) => {
+  if (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    typeof value === "boolean"
+  ) {
+    return NaN;
+  }
+
+  return Number(value);
+};
+
+const sendServerError = (res, message, error) => {
+  console.error(message, error);
+
+  return res.status(500).json({
+    success: false,
+    message,
+  });
+};
+
+// ======================================
+// 4. Notification Helper
+// ======================================
 
 const createNotification = async ({
   recipientEmail,
@@ -91,17 +184,135 @@ const createNotification = async ({
       createdAt: new Date(),
     };
 
-    return await db
-      .collection("notifications")
-      .insertOne(notification);
+    return await db.collection("notifications").insertOne(notification);
   } catch (error) {
-    console.error("Notification creation error:", error);
+    console.error("Notification creation error:", error.message);
     return null;
   }
 };
 
 // ======================================
-// 3. Test Route
+// 5. Studio Input Validation
+// ======================================
+
+const validateStudioFields = (data, isCreate = false) => {
+  const errors = [];
+
+  if (
+    isCreate ||
+    Object.prototype.hasOwnProperty.call(data, "title")
+  ) {
+    if (!isValidString(data.title, MAX_TITLE_LENGTH)) {
+      errors.push("Title is required and must be under 120 characters.");
+    }
+  }
+
+  if (
+    isCreate ||
+    Object.prototype.hasOwnProperty.call(data, "category")
+  ) {
+    if (
+      typeof data.category !== "string" ||
+      !STUDIO_CATEGORIES.includes(data.category.trim())
+    ) {
+      errors.push("Please select a valid studio category.");
+    }
+  }
+
+  if (
+    isCreate ||
+    Object.prototype.hasOwnProperty.call(data, "hourlyRate")
+  ) {
+    const rate = parsePositiveNumber(data.hourlyRate);
+
+    if (!Number.isFinite(rate) || rate <= 0 || rate > 1000000) {
+      errors.push("Hourly rate must be greater than 0.");
+    }
+  }
+
+  if (
+    isCreate ||
+    Object.prototype.hasOwnProperty.call(data, "securityDeposit")
+  ) {
+    const deposit = parsePositiveNumber(data.securityDeposit);
+
+    if (
+      !Number.isFinite(deposit) ||
+      deposit < 0 ||
+      deposit > 10000000
+    ) {
+      errors.push("Security deposit must be 0 or greater.");
+    }
+  }
+
+  if (
+    isCreate ||
+    Object.prototype.hasOwnProperty.call(data, "maxCapacity")
+  ) {
+    const capacity = parsePositiveNumber(data.maxCapacity);
+
+    if (
+      !Number.isInteger(capacity) ||
+      capacity < 1 ||
+      capacity > 10000
+    ) {
+      errors.push("Maximum capacity must be a positive integer.");
+    }
+  }
+
+  if (
+    isCreate ||
+    Object.prototype.hasOwnProperty.call(data, "location")
+  ) {
+    if (!isValidString(data.location, MAX_LOCATION_LENGTH)) {
+      errors.push("Location is required and must be under 200 characters.");
+    }
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(data, "imageUrl") ||
+    isCreate
+  ) {
+    if (!isValidImageUrl(data.imageUrl)) {
+      errors.push("Please provide a valid HTTP or HTTPS image URL.");
+    }
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(data, "description") ||
+    isCreate
+  ) {
+    if (
+      typeof data.description !== "string" ||
+      data.description.trim().length > MAX_DESCRIPTION_LENGTH
+    ) {
+      errors.push("Description must be under 3000 characters.");
+    }
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(data, "amenities") ||
+    isCreate
+  ) {
+    if (
+      !Array.isArray(data.amenities) ||
+      data.amenities.length > MAX_AMENITIES ||
+      !data.amenities.every(
+        (item) =>
+          typeof item === "string" &&
+          item.trim().length > 0 &&
+          item.trim().length <= MAX_AMENITY_LENGTH
+      )
+    ) {
+      errors.push("Amenities must be a valid list of up to 30 items.");
+    }
+  }
+
+  return errors;
+};
+
+// ======================================
+// 6. Test Route
 // ======================================
 
 app.get("/", (req, res) => {
@@ -109,7 +320,7 @@ app.get("/", (req, res) => {
 });
 
 // ======================================
-// 4. Authentication Check
+// 7. Authentication Check
 // ======================================
 
 app.get("/api/auth-check", requireAuth, (req, res) => {
@@ -125,144 +336,108 @@ app.get("/api/auth-check", requireAuth, (req, res) => {
 });
 
 // ======================================
-// 5. Get All Studios (Public)
+// 8. Get All Studios (Public)
 // ======================================
 
 app.get("/api/studios", async (req, res) => {
   try {
     const studios = await db
       .collection("studios")
-      .find()
+      .find({ isDeleted: { $ne: true } })
       .sort({ createdAt: -1 })
       .toArray();
 
     res.status(200).json(studios);
   } catch (error) {
-    console.error("Get studios error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch studios",
-    });
+    sendServerError(res, "Failed to fetch studios.", error);
   }
 });
 
 // ======================================
-// 6. Get Featured Studios (Public)
+// 9. Get Featured Studios (Public)
 // ======================================
 
 app.get("/api/featured-studios", async (req, res) => {
   try {
     const studios = await db
       .collection("studios")
-      .find()
+      .find({ isDeleted: { $ne: true } })
       .sort({ createdAt: -1 })
       .limit(6)
       .toArray();
 
     res.status(200).json(studios);
   } catch (error) {
-    console.error("Featured studios error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch featured studios",
-    });
+    sendServerError(res, "Failed to fetch featured studios.", error);
   }
 });
 
 // ======================================
-// 7. Get Single Studio (Public)
+// 10. Get Single Studio (Public)
 // ======================================
 
 app.get("/api/studios/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({
-        message: "Invalid studio ID",
+        message: "Invalid studio ID.",
       });
     }
 
     const studio = await db.collection("studios").findOne({
       _id: new ObjectId(id),
+      isDeleted: { $ne: true },
     });
 
     if (!studio) {
       return res.status(404).json({
-        message: "Studio not found",
+        message: "Studio not found.",
       });
     }
 
     res.status(200).json(studio);
   } catch (error) {
-    console.error("Get studio details error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch studio details",
-    });
+    sendServerError(res, "Failed to fetch studio details.", error);
   }
 });
 
 // ======================================
-// 8. Add New Studio (Protected)
+// 11. Add New Studio (Protected)
 // ======================================
 
 app.post("/api/studios", requireAuth, async (req, res) => {
   try {
+    const errors = validateStudioFields(req.body, true);
+
+    if (errors.length > 0) {
+      return res.status(400).json({
+        message: "Invalid studio information.",
+        errors,
+      });
+    }
+
     const studio = req.body;
 
-    if (
-      typeof studio.title !== "string" ||
-      !studio.title.trim() ||
-      typeof studio.category !== "string" ||
-      !studio.category.trim()
-    ) {
-      return res.status(400).json({
-        message: "Title and category are required",
-      });
-    }
-
-    const hourlyRate = Number(studio.hourlyRate);
-    const securityDeposit = Number(studio.securityDeposit);
-    const maxCapacity = Number(studio.maxCapacity);
-
-    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
-      return res.status(400).json({
-        message: "Invalid hourly rate",
-      });
-    }
-
-    if (
-      !Number.isFinite(securityDeposit) ||
-      securityDeposit < 0
-    ) {
-      return res.status(400).json({
-        message: "Invalid security deposit",
-      });
-    }
-
-    if (!Number.isInteger(maxCapacity) || maxCapacity < 1) {
-      return res.status(400).json({
-        message: "Invalid maximum capacity",
-      });
-    }
-
-    // Never trust ownerEmail from frontend.
     const studioData = {
       title: studio.title.trim(),
       category: studio.category.trim(),
-      hourlyRate,
-      securityDeposit,
-      maxCapacity,
-      location: studio.location,
-      imageUrl: studio.imageUrl,
-      amenities: Array.isArray(studio.amenities)
-        ? studio.amenities
-        : [],
-      description: studio.description,
+      hourlyRate: Number(studio.hourlyRate),
+      securityDeposit: Number(studio.securityDeposit),
+      maxCapacity: Number(studio.maxCapacity),
+      location: studio.location.trim(),
+      imageUrl: studio.imageUrl.trim(),
+      amenities: studio.amenities.map((item) => item.trim()),
+      description: studio.description.trim(),
+
+      // Owner identity comes only from authenticated session.
       ownerName: req.user.name || "",
       ownerEmail: getUserEmail(req),
+
+      isDeleted: false,
       createdAt: new Date(),
+      updatedAt: new Date(),
     };
 
     const result = await db
@@ -270,23 +445,22 @@ app.post("/api/studios", requireAuth, async (req, res) => {
       .insertOne(studioData);
 
     res.status(201).json({
-      message: "Studio created successfully",
+      message: "Studio created successfully.",
       insertedId: result.insertedId,
     });
   } catch (error) {
-    console.error("Add studio error:", error);
-
-    res.status(500).json({
-      message: "Failed to create studio",
-    });
+    sendServerError(res, "Failed to create studio.", error);
   }
 });
 
 // ======================================
-// 9. Create Booking (Protected)
+// 12. Create Booking (Protected)
 // ======================================
 
 app.post("/api/bookings", requireAuth, async (req, res) => {
+  let lockToken;
+  let studioObjectId;
+
   try {
     const {
       studioId,
@@ -308,27 +482,16 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       });
     }
 
-    if (!ObjectId.isValid(studioId)) {
+    if (!isValidObjectId(studioId)) {
       return res.status(400).json({
         message: "Invalid studio ID.",
       });
     }
 
-    const customerEmail = getUserEmail(req);
-
-    if (!customerEmail) {
-      return res.status(401).json({
-        message: "Authenticated email is unavailable.",
-      });
-    }
-
-    const validDate = /^\d{4}-\d{2}-\d{2}$/;
-    const validTime = /^([01]\d|2[0-3]):[0-5]\d$/;
-
     if (
-      !validDate.test(bookingDate) ||
-      !validTime.test(startTime) ||
-      !validTime.test(endTime)
+      !isValidDate(bookingDate) ||
+      !isValidTime(startTime) ||
+      !isValidTime(endTime)
     ) {
       return res.status(400).json({
         message: "Invalid booking date or time.",
@@ -341,14 +504,29 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       });
     }
 
-    if (!Number.isInteger(guests) || guests < 1) {
+    if (
+      !Number.isInteger(guests) ||
+      guests < 1 ||
+      guests > 10000
+    ) {
       return res.status(400).json({
-        message: "Guest number must be at least 1.",
+        message: "Guest number must be a valid positive integer.",
       });
     }
 
+    const customerEmail = getUserEmail(req);
+
+    if (!customerEmail) {
+      return res.status(401).json({
+        message: "Authenticated email is unavailable.",
+      });
+    }
+
+    studioObjectId = new ObjectId(studioId);
+
     const studio = await db.collection("studios").findOne({
-      _id: new ObjectId(studioId),
+      _id: studioObjectId,
+      isDeleted: { $ne: true },
     });
 
     if (!studio) {
@@ -363,10 +541,9 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       });
     }
 
-    if (
-      !Number.isFinite(Number(studio.hourlyRate)) ||
-      Number(studio.hourlyRate) <= 0
-    ) {
+    const hourlyRate = Number(studio.hourlyRate);
+
+    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
       return res.status(400).json({
         message: "Studio hourly rate is invalid.",
       });
@@ -375,20 +552,50 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
     const [startHour, startMinute] = startTime.split(":").map(Number);
     const [endHour, endMinute] = endTime.split(":").map(Number);
 
-    const startMinutes = startHour * 60 + startMinute;
-    const endMinutes = endHour * 60 + endMinute;
+    const totalHours =
+      (endHour * 60 + endMinute - (startHour * 60 + startMinute)) / 60;
 
-    const totalHours = (endMinutes - startMinutes) / 60;
-    const totalPrice = totalHours * Number(studio.hourlyRate);
+    const totalPrice = totalHours * hourlyRate;
+
+    if (!Number.isFinite(totalPrice) || totalPrice <= 0) {
+      return res.status(400).json({
+        message: "Invalid booking duration or price.",
+      });
+    }
+
+    // Atomic per-studio lock prevents two requests from checking
+    // availability and inserting at the same time.
+    lockToken = randomUUID();
+
+    const lockResult = await db.collection("studios").updateOne(
+      {
+        _id: studioObjectId,
+        isDeleted: { $ne: true },
+        $or: [
+          { bookingLockUntil: { $exists: false } },
+          { bookingLockUntil: { $lt: new Date() } },
+        ],
+      },
+      {
+        $set: {
+          bookingLockToken: lockToken,
+          bookingLockUntil: new Date(Date.now() + 30000),
+        },
+      }
+    );
+
+    if (lockResult.modifiedCount !== 1) {
+      return res.status(409).json({
+        message: "This studio is currently processing another booking. Please try again.",
+      });
+    }
 
     const overlappingBooking = await db
       .collection("bookings")
       .findOne({
         studioId: String(studioId),
         bookingDate,
-        status: {
-          $nin: ["Cancelled", "Rejected"],
-        },
+        status: { $in: ["Pending", "Confirmed"] },
         startTime: { $lt: endTime },
         endTime: { $gt: startTime },
       });
@@ -409,10 +616,11 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       endTime,
       guests,
       totalHours,
-      hourlyRate: Number(studio.hourlyRate),
+      hourlyRate,
       totalPrice,
       status: "Pending",
       createdAt: new Date(),
+      updatedAt: new Date(),
     };
 
     const result = await db
@@ -437,40 +645,50 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Create booking error:", error);
-
-    res.status(500).json({
-      message: "Failed to create booking.",
-    });
+    sendServerError(res, "Failed to create booking.", error);
+  } finally {
+    // Release only the lock created by this request.
+    if (lockToken && studioObjectId) {
+      try {
+        await db.collection("studios").updateOne(
+          {
+            _id: studioObjectId,
+            bookingLockToken: lockToken,
+          },
+          {
+            $unset: {
+              bookingLockToken: "",
+              bookingLockUntil: "",
+            },
+          }
+        );
+      } catch (error) {
+        console.error("Booking lock release error:", error.message);
+      }
+    }
   }
 });
 
 // ======================================
-// 10. Get My Bookings (Protected)
+// 13. Get My Bookings (Protected)
 // ======================================
 
 app.get("/api/my-bookings", requireAuth, async (req, res) => {
   try {
-    const customerEmail = getUserEmail(req);
-
     const bookings = await db
       .collection("bookings")
-      .find({ customerEmail })
+      .find({ customerEmail: getUserEmail(req) })
       .sort({ createdAt: -1 })
       .toArray();
 
     res.status(200).json(bookings);
   } catch (error) {
-    console.error("My bookings error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch bookings.",
-    });
+    sendServerError(res, "Failed to fetch bookings.", error);
   }
 });
 
 // ======================================
-// 11. Cancel Pending Booking (Protected)
+// 14. Cancel Pending Booking (Protected)
 // ======================================
 
 app.patch(
@@ -480,7 +698,7 @@ app.patch(
     try {
       const { id } = req.params;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({
           message: "Invalid booking ID.",
         });
@@ -510,48 +728,43 @@ app.patch(
         message: "Booking cancelled successfully!",
       });
     } catch (error) {
-      console.error("Cancel booking error:", error);
-
-      res.status(500).json({
-        message: "Failed to cancel booking.",
-      });
+      sendServerError(res, "Failed to cancel booking.", error);
     }
   }
 );
 
 // ======================================
-// 12. Get My Listings (Protected)
+// 15. Get My Listings (Protected)
 // ======================================
 
 app.get("/api/my-listings", requireAuth, async (req, res) => {
   try {
     const studios = await db
       .collection("studios")
-      .find({ ownerEmail: getUserEmail(req) })
+      .find({
+        ownerEmail: getUserEmail(req),
+        isDeleted: { $ne: true },
+      })
       .sort({ createdAt: -1 })
       .toArray();
 
     res.status(200).json(studios);
   } catch (error) {
-    console.error("My listings error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch your listings",
-    });
+    sendServerError(res, "Failed to fetch your listings.", error);
   }
 });
 
 // ======================================
-// 13. Update Studio (Owner Only)
+// 16. Update Studio (Owner Only)
 // ======================================
 
 app.patch("/api/studios/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({
-        message: "Invalid studio ID",
+        message: "Invalid studio ID.",
       });
     }
 
@@ -577,54 +790,54 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
 
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({
-        message: "No valid fields provided for update",
+        message: "No valid fields provided for update.",
       });
     }
 
-    if (
-      updateData.title !== undefined &&
-      (typeof updateData.title !== "string" ||
-        !updateData.title.trim())
-    ) {
+    const errors = validateStudioFields(updateData);
+
+    if (errors.length > 0) {
       return res.status(400).json({
-        message: "Studio title is invalid",
+        message: "Invalid studio information.",
+        errors,
       });
+    }
+
+    // Normalize values before saving.
+    if (updateData.title !== undefined) {
+      updateData.title = updateData.title.trim();
+    }
+
+    if (updateData.category !== undefined) {
+      updateData.category = updateData.category.trim();
     }
 
     if (updateData.hourlyRate !== undefined) {
-      const rate = Number(updateData.hourlyRate);
-
-      if (!Number.isFinite(rate) || rate <= 0) {
-        return res.status(400).json({
-          message: "Hourly rate must be greater than zero",
-        });
-      }
-
-      updateData.hourlyRate = rate;
+      updateData.hourlyRate = Number(updateData.hourlyRate);
     }
 
     if (updateData.securityDeposit !== undefined) {
-      const deposit = Number(updateData.securityDeposit);
-
-      if (!Number.isFinite(deposit) || deposit < 0) {
-        return res.status(400).json({
-          message: "Security deposit cannot be negative",
-        });
-      }
-
-      updateData.securityDeposit = deposit;
+      updateData.securityDeposit = Number(updateData.securityDeposit);
     }
 
     if (updateData.maxCapacity !== undefined) {
-      const capacity = Number(updateData.maxCapacity);
+      updateData.maxCapacity = Number(updateData.maxCapacity);
+    }
 
-      if (!Number.isInteger(capacity) || capacity < 1) {
-        return res.status(400).json({
-          message: "Maximum capacity must be a positive integer",
-        });
-      }
+    if (updateData.location !== undefined) {
+      updateData.location = updateData.location.trim();
+    }
 
-      updateData.maxCapacity = capacity;
+    if (updateData.imageUrl !== undefined) {
+      updateData.imageUrl = updateData.imageUrl.trim();
+    }
+
+    if (updateData.description !== undefined) {
+      updateData.description = updateData.description.trim();
+    }
+
+    if (updateData.amenities !== undefined) {
+      updateData.amenities = updateData.amenities.map((item) => item.trim());
     }
 
     updateData.updatedAt = new Date();
@@ -633,6 +846,7 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
       {
         _id: new ObjectId(id),
         ownerEmail: getUserEmail(req),
+        isDeleted: { $ne: true },
       },
       {
         $set: updateData,
@@ -641,74 +855,100 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
 
     if (result.matchedCount === 0) {
       return res.status(404).json({
-        message: "Studio not found or you are not the owner",
+        message: "Studio not found or you are not the owner.",
       });
     }
 
     res.status(200).json({
-      message: "Studio updated successfully",
+      message: "Studio updated successfully.",
     });
   } catch (error) {
-    console.error("Update studio error:", error);
-
-    res.status(500).json({
-      message: "Failed to update studio",
-    });
+    sendServerError(res, "Failed to update studio.", error);
   }
 });
 
 // ======================================
-// 14. Delete Studio (Owner Only)
+// 17. Delete Studio (Owner Only)
+// Soft Delete: preserve booking history.
 // ======================================
 
 app.delete("/api/studios/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({
-        message: "Invalid studio ID",
+        message: "Invalid studio ID.",
       });
     }
 
-    const result = await db.collection("studios").deleteOne({
-      _id: new ObjectId(id),
-      ownerEmail: getUserEmail(req),
-    });
+    const studioId = new ObjectId(id);
+    const ownerEmail = getUserEmail(req);
 
-    if (result.deletedCount === 0) {
+    const result = await db.collection("studios").updateOne(
+      {
+        _id: studioId,
+        ownerEmail,
+        isDeleted: { $ne: true },
+      },
+      {
+        $set: {
+          isDeleted: true,
+          deletedAt: new Date(),
+          updatedAt: new Date(),
+        },
+        $unset: {
+          bookingLockToken: "",
+          bookingLockUntil: "",
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
       return res.status(404).json({
-        message: "Studio not found or you are not the owner",
+        message: "Studio not found or you are not the owner.",
       });
     }
+
+    // Cancel pending requests so the deleted studio cannot
+    // receive new booking confirmations.
+    await db.collection("bookings").updateMany(
+      {
+        studioId: String(studioId),
+        status: "Pending",
+      },
+      {
+        $set: {
+          status: "Cancelled",
+          updatedAt: new Date(),
+          cancellationReason: "Studio listing was deleted.",
+        },
+      }
+    );
 
     res.status(200).json({
-      message: "Studio deleted successfully",
+      message: "Studio deleted successfully.",
     });
   } catch (error) {
-    console.error("Delete studio error:", error);
-
-    res.status(500).json({
-      message: "Failed to delete studio",
-    });
+    sendServerError(res, "Failed to delete studio.", error);
   }
 });
 
 // ======================================
-// 15. Get Owner Bookings (Protected)
+// 18. Get Owner Bookings (Protected)
 // ======================================
 
 app.get("/api/owner-bookings", requireAuth, async (req, res) => {
   try {
     const studios = await db
       .collection("studios")
-      .find({ ownerEmail: getUserEmail(req) })
+      .find({
+        ownerEmail: getUserEmail(req),
+      })
       .project({ _id: 1 })
       .toArray();
 
-    const studioIds = studios.map((studio) =>
-      studio._id.toString()
-    );
+    const studioIds = studios.map((studio) => studio._id.toString());
 
     if (studioIds.length === 0) {
       return res.status(200).json([]);
@@ -724,16 +964,12 @@ app.get("/api/owner-bookings", requireAuth, async (req, res) => {
 
     res.status(200).json(bookings);
   } catch (error) {
-    console.error("Owner bookings error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch owner bookings",
-    });
+    sendServerError(res, "Failed to fetch owner bookings.", error);
   }
 });
 
 // ======================================
-// 16. Owner Confirms or Rejects Booking
+// 19. Owner Confirms or Rejects Booking
 // ======================================
 
 app.patch(
@@ -744,15 +980,15 @@ app.patch(
       const { id } = req.params;
       const { status } = req.body;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({
-          message: "Invalid booking ID",
+          message: "Invalid booking ID.",
         });
       }
 
       if (!["Confirmed", "Rejected"].includes(status)) {
         return res.status(400).json({
-          message: "Status must be Confirmed or Rejected",
+          message: "Status must be Confirmed or Rejected.",
         });
       }
 
@@ -762,27 +998,29 @@ app.patch(
 
       if (!booking) {
         return res.status(404).json({
-          message: "Booking not found",
+          message: "Booking not found.",
         });
       }
 
-      if (!ObjectId.isValid(booking.studioId)) {
+      if (!isValidObjectId(booking.studioId)) {
         return res.status(400).json({
-          message: "Booking contains an invalid studio ID",
+          message: "Booking contains an invalid studio ID.",
         });
       }
 
       const studio = await db.collection("studios").findOne({
         _id: new ObjectId(booking.studioId),
         ownerEmail: getUserEmail(req),
+        isDeleted: { $ne: true },
       });
 
       if (!studio) {
         return res.status(403).json({
-          message: "You are not the owner of this studio",
+          message: "You are not the owner of this active studio.",
         });
       }
 
+      // Conditional update prevents changing an already processed booking.
       const result = await db.collection("bookings").updateOne(
         {
           _id: new ObjectId(id),
@@ -798,7 +1036,7 @@ app.patch(
 
       if (result.matchedCount === 0) {
         return res.status(409).json({
-          message: "Booking is no longer Pending",
+          message: "Booking is no longer Pending.",
         });
       }
 
@@ -821,21 +1059,17 @@ app.patch(
       });
 
       res.status(200).json({
-        message: `Booking ${status.toLowerCase()} successfully`,
+        message: `Booking ${status.toLowerCase()} successfully.`,
         status,
       });
     } catch (error) {
-      console.error("Update booking status error:", error);
-
-      res.status(500).json({
-        message: "Failed to update booking status",
-      });
+      sendServerError(res, "Failed to update booking status.", error);
     }
   }
 );
 
 // ======================================
-// 17. Get My Notifications (Protected)
+// 20. Get My Notifications (Protected)
 // ======================================
 
 app.get("/api/notifications", requireAuth, async (req, res) => {
@@ -849,16 +1083,12 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
 
     res.status(200).json(notifications);
   } catch (error) {
-    console.error("Get notifications error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch notifications",
-    });
+    sendServerError(res, "Failed to fetch notifications.", error);
   }
 });
 
 // ======================================
-// 18. Mark Single Notification as Read
+// 21. Mark Single Notification as Read
 // ======================================
 
 app.patch(
@@ -868,9 +1098,9 @@ app.patch(
     try {
       const { id } = req.params;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({
-          message: "Invalid notification ID",
+          message: "Invalid notification ID.",
         });
       }
 
@@ -889,25 +1119,21 @@ app.patch(
 
       if (result.matchedCount === 0) {
         return res.status(404).json({
-          message: "Notification not found",
+          message: "Notification not found.",
         });
       }
 
       res.status(200).json({
-        message: "Notification marked as read",
+        message: "Notification marked as read.",
       });
     } catch (error) {
-      console.error("Mark notification read error:", error);
-
-      res.status(500).json({
-        message: "Failed to update notification",
-      });
+      sendServerError(res, "Failed to update notification.", error);
     }
   }
 );
 
 // ======================================
-// 19. Mark All Notifications as Read
+// 22. Mark All Notifications as Read
 // ======================================
 
 app.patch(
@@ -929,21 +1155,35 @@ app.patch(
       );
 
       res.status(200).json({
-        message: "All notifications marked as read",
+        message: "All notifications marked as read.",
         modifiedCount: result.modifiedCount,
       });
     } catch (error) {
-      console.error("Mark all notifications error:", error);
-
-      res.status(500).json({
-        message: "Failed to update notifications",
-      });
+      sendServerError(res, "Failed to update notifications.", error);
     }
   }
 );
 
 // ======================================
-// 20. Start Server
+// 23. JSON Error Handler
+// ======================================
+
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    return res.status(400).json({
+      message: "Invalid JSON request body.",
+    });
+  }
+
+  console.error("Unhandled server error:", err);
+
+  return res.status(500).json({
+    message: "Internal server error.",
+  });
+});
+
+// ======================================
+// 24. Start Server
 // ======================================
 
 async function startServer() {
@@ -951,9 +1191,8 @@ async function startServer() {
     db = await connectDB();
 
     app.listen(PORT, () => {
-      console.log(
-        `StudioSpace Server running on port ${PORT}`
-      );
+      console.log(`StudioSpace Server running on port ${PORT}`);
+      console.log(`Allowed frontend origin: ${CLIENT_URL}`);
     });
   } catch (error) {
     console.error("Server startup failed:", error.message);
