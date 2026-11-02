@@ -386,7 +386,128 @@ app.get("/api/my-listings", async (req, res) => {
   }
 });
 // ======================================
-// 9. Start Server
+// 9. Update Studio (PATCH)
+// ======================================
+
+app.patch("/api/studios/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ownerEmail, ...updates } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid studio ID",
+      });
+    }
+
+    if (!ownerEmail || typeof ownerEmail !== "string") {
+      return res.status(400).json({
+        message: "Owner email is required",
+      });
+    }
+
+    // Only allow these fields to be updated
+    const allowedFields = [
+      "title",
+      "category",
+      "hourlyRate",
+      "securityDeposit",
+      "maxCapacity",
+      "location",
+      "imageUrl",
+      "amenities",
+      "description",
+    ];
+
+    const updateData = {};
+
+    for (const field of allowedFields) {
+      if (updates[field] !== undefined) {
+        updateData[field] = updates[field];
+      }
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({
+        message: "No valid fields provided for update",
+      });
+    }
+
+    updateData.updatedAt = new Date();
+
+    const result = await db.collection("studios").updateOne(
+      {
+        _id: new ObjectId(id),
+        ownerEmail: ownerEmail.trim().toLowerCase(),
+      },
+      {
+        $set: updateData,
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "Studio not found or you are not the owner",
+      });
+    }
+
+    res.status(200).json({
+      message: "Studio updated successfully",
+    });
+  } catch (error) {
+    console.error("Update studio error:", error);
+
+    res.status(500).json({
+      message: "Failed to update studio",
+    });
+  }
+});
+
+// ======================================
+// 10. Delete Studio (DELETE)
+// ======================================
+
+app.delete("/api/studios/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ownerEmail } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid studio ID",
+      });
+    }
+
+    if (!ownerEmail || typeof ownerEmail !== "string") {
+      return res.status(400).json({
+        message: "Owner email is required",
+      });
+    }
+
+    const result = await db.collection("studios").deleteOne({
+      _id: new ObjectId(id),
+      ownerEmail: ownerEmail.trim().toLowerCase(),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        message: "Studio not found or you are not the owner",
+      });
+    }
+
+    res.status(200).json({
+      message: "Studio deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete studio error:", error);
+
+    res.status(500).json({
+      message: "Failed to delete studio",
+    });
+  }
+});
+// ======================================
+// 11. Start Server
 // ======================================
 
 async function startServer() {
