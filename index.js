@@ -14,12 +14,49 @@ app.use(express.json());
 let db;
 
 // ======================================
-// Helper: Normalize Email
+// Helper 1: Normalize Email
 // ======================================
 
 const normalizeEmail = (email) => {
   if (typeof email !== "string") return "";
   return email.trim().toLowerCase();
+};
+
+// ======================================
+// Helper 2: Create Notification
+// ======================================
+
+const createNotification = async ({
+  recipientEmail,
+  title,
+  message,
+  type,
+  bookingId,
+  studioId,
+}) => {
+  try {
+    const email = normalizeEmail(recipientEmail);
+
+    if (!email) return null;
+
+    const notification = {
+      recipientEmail: email,
+      title,
+      message,
+      type,
+      bookingId: String(bookingId),
+      studioId: String(studioId),
+      isRead: false,
+      createdAt: new Date(),
+    };
+
+    return await db
+      .collection("notifications")
+      .insertOne(notification);
+  } catch (error) {
+    console.error("Notification creation error:", error);
+    return null;
+  }
 };
 
 // ======================================
@@ -177,7 +214,6 @@ app.post("/api/bookings", async (req, res) => {
       guests,
     } = req.body;
 
-    // Validate required fields
     if (
       !studioId ||
       typeof customerName !== "string" ||
@@ -194,15 +230,14 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Validate Studio ID
     if (!ObjectId.isValid(studioId)) {
       return res.status(400).json({
         message: "Invalid studio ID.",
       });
     }
 
-    // Validate email
-    const normalizedCustomerEmail = normalizeEmail(customerEmail);
+    const normalizedCustomerEmail =
+      normalizeEmail(customerEmail);
 
     if (!normalizedCustomerEmail) {
       return res.status(400).json({
@@ -210,7 +245,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Validate date and time
     const validDate = /^\d{4}-\d{2}-\d{2}$/;
     const validTime = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -236,7 +270,6 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Find Studio
     const studio = await db.collection("studios").findOne({
       _id: new ObjectId(studioId),
     });
@@ -262,32 +295,43 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    // Calculate duration and price
-    const [startHour, startMinute] = startTime.split(":").map(Number);
-    const [endHour, endMinute] = endTime.split(":").map(Number);
+    const [startHour, startMinute] = startTime
+      .split(":")
+      .map(Number);
+
+    const [endHour, endMinute] = endTime
+      .split(":")
+      .map(Number);
 
     const startMinutes = startHour * 60 + startMinute;
     const endMinutes = endHour * 60 + endMinute;
 
-    const totalHours = (endMinutes - startMinutes) / 60;
-    const totalPrice = totalHours * Number(studio.hourlyRate);
+    const totalHours =
+      (endMinutes - startMinutes) / 60;
+
+    const totalPrice =
+      totalHours * Number(studio.hourlyRate);
 
     // Check overlapping bookings
-    const overlappingBooking = await db.collection("bookings").findOne({
-      studioId: String(studioId),
-      bookingDate,
-      status: { $nin: ["Cancelled", "Rejected"] },
-      startTime: { $lt: endTime },
-      endTime: { $gt: startTime },
-    });
+    const overlappingBooking = await db
+      .collection("bookings")
+      .findOne({
+        studioId: String(studioId),
+        bookingDate,
+        status: {
+          $nin: ["Cancelled", "Rejected"],
+        },
+        startTime: { $lt: endTime },
+        endTime: { $gt: startTime },
+      });
 
     if (overlappingBooking) {
       return res.status(409).json({
-        message: "This studio is already booked during that time.",
+        message:
+          "This studio is already booked during that time.",
       });
     }
 
-    // Save booking
     const bookingData = {
       studioId: String(studioId),
       studioTitle: studio.title,
@@ -304,7 +348,19 @@ app.post("/api/bookings", async (req, res) => {
       createdAt: new Date(),
     };
 
-    const result = await db.collection("bookings").insertOne(bookingData);
+    const result = await db
+      .collection("bookings")
+      .insertOne(bookingData);
+
+    // Notify Studio Owner
+    await createNotification({
+      recipientEmail: studio.ownerEmail,
+      title: "New Booking Request",
+      message: `${customerName.trim()} has requested to book your studio: ${studio.title}.`,
+      type: "booking_request",
+      bookingId: result.insertedId,
+      studioId: studio._id,
+    });
 
     res.status(201).json({
       message: "Booking request submitted successfully!",
@@ -329,8 +385,7 @@ app.post("/api/bookings", async (req, res) => {
 
 app.get("/api/my-bookings", async (req, res) => {
   try {
-    const { email } = req.query;
-    const customerEmail = normalizeEmail(email);
+    const customerEmail = normalizeEmail(req.query.email);
 
     if (!customerEmail) {
       return res.status(400).json({
@@ -340,9 +395,7 @@ app.get("/api/my-bookings", async (req, res) => {
 
     const bookings = await db
       .collection("bookings")
-      .find({
-        customerEmail,
-      })
+      .find({ customerEmail })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -393,7 +446,8 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
 
     if (result.matchedCount === 0) {
       return res.status(404).json({
-        message: "Booking not found, or booking cannot be cancelled.",
+        message:
+          "Booking not found, or booking cannot be cancelled.",
       });
     }
 
@@ -425,9 +479,7 @@ app.get("/api/my-listings", async (req, res) => {
 
     const studios = await db
       .collection("studios")
-      .find({
-        ownerEmail: email,
-      })
+      .find({ ownerEmail: email })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -492,7 +544,8 @@ app.patch("/api/studios/:id", async (req, res) => {
 
     if (
       updateData.title !== undefined &&
-      (typeof updateData.title !== "string" || !updateData.title.trim())
+      (typeof updateData.title !== "string" ||
+        !updateData.title.trim())
     ) {
       return res.status(400).json({
         message: "Studio title is invalid",
@@ -525,7 +578,8 @@ app.patch("/api/studios/:id", async (req, res) => {
         Number(updateData.maxCapacity) < 1)
     ) {
       return res.status(400).json({
-        message: "Maximum capacity must be a positive integer",
+        message:
+          "Maximum capacity must be a positive integer",
       });
     }
 
@@ -543,7 +597,8 @@ app.patch("/api/studios/:id", async (req, res) => {
 
     if (result.matchedCount === 0) {
       return res.status(404).json({
-        message: "Studio not found or you are not the owner",
+        message:
+          "Studio not found or you are not the owner",
       });
     }
 
@@ -587,7 +642,8 @@ app.delete("/api/studios/:id", async (req, res) => {
 
     if (result.deletedCount === 0) {
       return res.status(404).json({
-        message: "Studio not found or you are not the owner",
+        message:
+          "Studio not found or you are not the owner",
       });
     }
 
@@ -617,16 +673,13 @@ app.get("/api/owner-bookings", async (req, res) => {
       });
     }
 
-    // Find studios belonging to this owner
     const studios = await db
       .collection("studios")
-      .find({
-        ownerEmail: email,
-      })
+      .find({ ownerEmail: email })
       .project({ _id: 1 })
       .toArray();
 
-    // Booking documents store studioId as String
+    // Booking studioId is stored as String
     const studioIds = studios.map((studio) =>
       studio._id.toString()
     );
@@ -681,7 +734,6 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
-    // Find booking
     const booking = await db.collection("bookings").findOne({
       _id: new ObjectId(id),
     });
@@ -692,7 +744,12 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
-    // Find the studio owned by this owner
+    if (!ObjectId.isValid(booking.studioId)) {
+      return res.status(400).json({
+        message: "Booking contains an invalid studio ID",
+      });
+    }
+
     const studio = await db.collection("studios").findOne({
       _id: new ObjectId(booking.studioId),
       ownerEmail: email,
@@ -704,7 +761,6 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
-    // Only Pending bookings can be changed
     const result = await db.collection("bookings").updateOne(
       {
         _id: new ObjectId(id),
@@ -724,6 +780,25 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
       });
     }
 
+    // Notify Customer
+    await createNotification({
+      recipientEmail: booking.customerEmail,
+      title:
+        status === "Confirmed"
+          ? "Booking Confirmed"
+          : "Booking Rejected",
+      message:
+        status === "Confirmed"
+          ? `Your booking for ${booking.studioTitle} has been confirmed.`
+          : `Your booking for ${booking.studioTitle} has been rejected.`,
+      type:
+        status === "Confirmed"
+          ? "booking_confirmed"
+          : "booking_rejected",
+      bookingId: booking._id,
+      studioId: booking.studioId,
+    });
+
     res.status(200).json({
       message: `Booking ${status.toLowerCase()} successfully`,
       status,
@@ -738,7 +813,130 @@ app.patch("/api/bookings/:id/status", async (req, res) => {
 });
 
 // ======================================
-// 14. Start Server
+// 14. Get My Notifications
+// ======================================
+
+app.get("/api/notifications", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+
+    if (!email) {
+      return res.status(400).json({
+        message: "User email is required",
+      });
+    }
+
+    const notifications = await db
+      .collection("notifications")
+      .find({ recipientEmail: email })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray();
+
+    res.status(200).json(notifications);
+  } catch (error) {
+    console.error("Get notifications error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch notifications",
+    });
+  }
+});
+
+// ======================================
+// 15. Mark Single Notification as Read
+// ======================================
+
+app.patch("/api/notifications/:id/read", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = normalizeEmail(req.body.email);
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid notification ID",
+      });
+    }
+
+    if (!email) {
+      return res.status(400).json({
+        message: "User email is required",
+      });
+    }
+
+    const result = await db.collection("notifications").updateOne(
+      {
+        _id: new ObjectId(id),
+        recipientEmail: email,
+      },
+      {
+        $set: {
+          isRead: true,
+          readAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "Notification not found",
+      });
+    }
+
+    res.status(200).json({
+      message: "Notification marked as read",
+    });
+  } catch (error) {
+    console.error("Mark notification read error:", error);
+
+    res.status(500).json({
+      message: "Failed to update notification",
+    });
+  }
+});
+
+// ======================================
+// 16. Mark All Notifications as Read
+// ======================================
+
+app.patch("/api/notifications/read-all", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+
+    if (!email) {
+      return res.status(400).json({
+        message: "User email is required",
+      });
+    }
+
+    const result = await db.collection("notifications").updateMany(
+      {
+        recipientEmail: email,
+        isRead: false,
+      },
+      {
+        $set: {
+          isRead: true,
+          readAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).json({
+      message: "All notifications marked as read",
+      modifiedCount: result.modifiedCount,
+    });
+  } catch (error) {
+    console.error("Mark all notifications error:", error);
+
+    res.status(500).json({
+      message: "Failed to update notifications",
+    });
+  }
+});
+
+// ======================================
+// 17. Start Server
 // ======================================
 
 async function startServer() {
@@ -746,7 +944,9 @@ async function startServer() {
     db = await connectDB();
 
     app.listen(PORT, () => {
-      console.log(`StudioSpace Server running on port ${PORT}`);
+      console.log(
+        `StudioSpace Server running on port ${PORT}`
+      );
     });
   } catch (error) {
     console.error("Server startup failed:", error.message);
