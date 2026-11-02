@@ -4,17 +4,58 @@ import cors from "cors";
 import "dotenv/config";
 import { connectDB } from "./db.js";
 import { ObjectId } from "mongodb";
+import { auth } from "./auth.js";
+import { fromNodeHeaders } from "better-auth/node";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    credentials: true,
+  })
+);
+
+// Better Auth already runs in Next.js.
+// Express only verifies its existing session.
 app.use(express.json());
 
 let db;
 
 // ======================================
-// Helper 1: Normalize Email
+// 1. Authentication Middleware
+// ======================================
+
+const requireAuth = async (req, res, next) => {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session || !session.user) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized. Please login first.",
+      });
+    }
+
+    req.user = session.user;
+    req.session = session.session;
+
+    next();
+  } catch (error) {
+    console.error("Session verification error:", error);
+
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired session.",
+    });
+  }
+};
+
+// ======================================
+// 2. Helper Functions
 // ======================================
 
 const normalizeEmail = (email) => {
@@ -22,9 +63,9 @@ const normalizeEmail = (email) => {
   return email.trim().toLowerCase();
 };
 
-// ======================================
-// Helper 2: Create Notification
-// ======================================
+const getUserEmail = (req) => {
+  return normalizeEmail(req.user?.email);
+};
 
 const createNotification = async ({
   recipientEmail,
@@ -60,7 +101,7 @@ const createNotification = async ({
 };
 
 // ======================================
-// 1. Test Route
+// 3. Test Route
 // ======================================
 
 app.get("/", (req, res) => {
@@ -68,7 +109,23 @@ app.get("/", (req, res) => {
 });
 
 // ======================================
-// 2. Get All Studios
+// 4. Authentication Check
+// ======================================
+
+app.get("/api/auth-check", requireAuth, (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Authentication successful!",
+    user: {
+      id: req.user.id,
+      name: req.user.name,
+      email: req.user.email,
+    },
+  });
+});
+
+// ======================================
+// 5. Get All Studios (Public)
 // ======================================
 
 app.get("/api/studios", async (req, res) => {
@@ -90,7 +147,7 @@ app.get("/api/studios", async (req, res) => {
 });
 
 // ======================================
-// 3. Get Featured Studios
+// 6. Get Featured Studios (Public)
 // ======================================
 
 app.get("/api/featured-studios", async (req, res) => {
@@ -113,7 +170,7 @@ app.get("/api/featured-studios", async (req, res) => {
 });
 
 // ======================================
-// 4. Get Single Studio Details
+// 7. Get Single Studio (Public)
 // ======================================
 
 app.get("/api/studios/:id", async (req, res) => {
@@ -147,10 +204,10 @@ app.get("/api/studios/:id", async (req, res) => {
 });
 
 // ======================================
-// 5. Add New Studio
+// 8. Add New Studio (Protected)
 // ======================================
 
-app.post("/api/studios", async (req, res) => {
+app.post("/api/studios", requireAuth, async (req, res) => {
   try {
     const studio = req.body;
 
@@ -165,19 +222,46 @@ app.post("/api/studios", async (req, res) => {
       });
     }
 
-    const ownerEmail = normalizeEmail(studio.ownerEmail);
+    const hourlyRate = Number(studio.hourlyRate);
+    const securityDeposit = Number(studio.securityDeposit);
+    const maxCapacity = Number(studio.maxCapacity);
 
-    if (!ownerEmail) {
+    if (!Number.isFinite(hourlyRate) || hourlyRate <= 0) {
       return res.status(400).json({
-        message: "Owner email is required",
+        message: "Invalid hourly rate",
       });
     }
 
+    if (
+      !Number.isFinite(securityDeposit) ||
+      securityDeposit < 0
+    ) {
+      return res.status(400).json({
+        message: "Invalid security deposit",
+      });
+    }
+
+    if (!Number.isInteger(maxCapacity) || maxCapacity < 1) {
+      return res.status(400).json({
+        message: "Invalid maximum capacity",
+      });
+    }
+
+    // Never trust ownerEmail from frontend.
     const studioData = {
-      ...studio,
       title: studio.title.trim(),
       category: studio.category.trim(),
-      ownerEmail,
+      hourlyRate,
+      securityDeposit,
+      maxCapacity,
+      location: studio.location,
+      imageUrl: studio.imageUrl,
+      amenities: Array.isArray(studio.amenities)
+        ? studio.amenities
+        : [],
+      description: studio.description,
+      ownerName: req.user.name || "",
+      ownerEmail: getUserEmail(req),
       createdAt: new Date(),
     };
 
@@ -199,15 +283,13 @@ app.post("/api/studios", async (req, res) => {
 });
 
 // ======================================
-// 6. Create New Booking
+// 9. Create Booking (Protected)
 // ======================================
 
-app.post("/api/bookings", async (req, res) => {
+app.post("/api/bookings", requireAuth, async (req, res) => {
   try {
     const {
       studioId,
-      customerName,
-      customerEmail,
       bookingDate,
       startTime,
       endTime,
@@ -216,10 +298,6 @@ app.post("/api/bookings", async (req, res) => {
 
     if (
       !studioId ||
-      typeof customerName !== "string" ||
-      !customerName.trim() ||
-      typeof customerEmail !== "string" ||
-      !customerEmail.trim() ||
       !bookingDate ||
       !startTime ||
       !endTime ||
@@ -236,12 +314,11 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    const normalizedCustomerEmail =
-      normalizeEmail(customerEmail);
+    const customerEmail = getUserEmail(req);
 
-    if (!normalizedCustomerEmail) {
-      return res.status(400).json({
-        message: "Valid customer email is required.",
+    if (!customerEmail) {
+      return res.status(401).json({
+        message: "Authenticated email is unavailable.",
       });
     }
 
@@ -295,24 +372,15 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    const [startHour, startMinute] = startTime
-      .split(":")
-      .map(Number);
-
-    const [endHour, endMinute] = endTime
-      .split(":")
-      .map(Number);
+    const [startHour, startMinute] = startTime.split(":").map(Number);
+    const [endHour, endMinute] = endTime.split(":").map(Number);
 
     const startMinutes = startHour * 60 + startMinute;
     const endMinutes = endHour * 60 + endMinute;
 
-    const totalHours =
-      (endMinutes - startMinutes) / 60;
+    const totalHours = (endMinutes - startMinutes) / 60;
+    const totalPrice = totalHours * Number(studio.hourlyRate);
 
-    const totalPrice =
-      totalHours * Number(studio.hourlyRate);
-
-    // Check overlapping bookings
     const overlappingBooking = await db
       .collection("bookings")
       .findOne({
@@ -327,16 +395,15 @@ app.post("/api/bookings", async (req, res) => {
 
     if (overlappingBooking) {
       return res.status(409).json({
-        message:
-          "This studio is already booked during that time.",
+        message: "This studio is already booked during that time.",
       });
     }
 
     const bookingData = {
       studioId: String(studioId),
       studioTitle: studio.title,
-      customerName: customerName.trim(),
-      customerEmail: normalizedCustomerEmail,
+      customerName: req.user.name || "",
+      customerEmail,
       bookingDate,
       startTime,
       endTime,
@@ -352,11 +419,10 @@ app.post("/api/bookings", async (req, res) => {
       .collection("bookings")
       .insertOne(bookingData);
 
-    // Notify Studio Owner
     await createNotification({
       recipientEmail: studio.ownerEmail,
       title: "New Booking Request",
-      message: `${customerName.trim()} has requested to book your studio: ${studio.title}.`,
+      message: `${req.user.name || customerEmail} has requested to book your studio: ${studio.title}.`,
       type: "booking_request",
       bookingId: result.insertedId,
       studioId: studio._id,
@@ -380,18 +446,12 @@ app.post("/api/bookings", async (req, res) => {
 });
 
 // ======================================
-// 7. Get My Bookings
+// 10. Get My Bookings (Protected)
 // ======================================
 
-app.get("/api/my-bookings", async (req, res) => {
+app.get("/api/my-bookings", requireAuth, async (req, res) => {
   try {
-    const customerEmail = normalizeEmail(req.query.email);
-
-    if (!customerEmail) {
-      return res.status(400).json({
-        message: "Customer email is required.",
-      });
-    }
+    const customerEmail = getUserEmail(req);
 
     const bookings = await db
       .collection("bookings")
@@ -410,76 +470,64 @@ app.get("/api/my-bookings", async (req, res) => {
 });
 
 // ======================================
-// 8. Cancel Pending Booking
+// 11. Cancel Pending Booking (Protected)
 // ======================================
 
-app.patch("/api/bookings/:id/cancel", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const email = normalizeEmail(req.body.email);
+app.patch(
+  "/api/bookings/:id/cancel",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        message: "Invalid booking ID.",
-      });
-    }
-
-    if (!email) {
-      return res.status(400).json({
-        message: "Customer email is required.",
-      });
-    }
-
-    const result = await db.collection("bookings").updateOne(
-      {
-        _id: new ObjectId(id),
-        customerEmail: email,
-        status: "Pending",
-      },
-      {
-        $set: {
-          status: "Cancelled",
-          updatedAt: new Date(),
-        },
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          message: "Invalid booking ID.",
+        });
       }
-    );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
-        message:
-          "Booking not found, or booking cannot be cancelled.",
+      const result = await db.collection("bookings").updateOne(
+        {
+          _id: new ObjectId(id),
+          customerEmail: getUserEmail(req),
+          status: "Pending",
+        },
+        {
+          $set: {
+            status: "Cancelled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          message: "Booking not found, or booking cannot be cancelled.",
+        });
+      }
+
+      res.status(200).json({
+        message: "Booking cancelled successfully!",
+      });
+    } catch (error) {
+      console.error("Cancel booking error:", error);
+
+      res.status(500).json({
+        message: "Failed to cancel booking.",
       });
     }
-
-    res.status(200).json({
-      message: "Booking cancelled successfully!",
-    });
-  } catch (error) {
-    console.error("Cancel booking error:", error);
-
-    res.status(500).json({
-      message: "Failed to cancel booking.",
-    });
   }
-});
+);
 
 // ======================================
-// 9. Get My Listings
+// 12. Get My Listings (Protected)
 // ======================================
 
-app.get("/api/my-listings", async (req, res) => {
+app.get("/api/my-listings", requireAuth, async (req, res) => {
   try {
-    const email = normalizeEmail(req.query.email);
-
-    if (!email) {
-      return res.status(400).json({
-        message: "Owner email is required",
-      });
-    }
-
     const studios = await db
       .collection("studios")
-      .find({ ownerEmail: email })
+      .find({ ownerEmail: getUserEmail(req) })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -494,25 +542,16 @@ app.get("/api/my-listings", async (req, res) => {
 });
 
 // ======================================
-// 10. Update Studio
+// 13. Update Studio (Owner Only)
 // ======================================
 
-app.patch("/api/studios/:id", async (req, res) => {
+app.patch("/api/studios/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { ownerEmail, ...updates } = req.body;
-
-    const email = normalizeEmail(ownerEmail);
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         message: "Invalid studio ID",
-      });
-    }
-
-    if (!email) {
-      return res.status(400).json({
-        message: "Owner email is required",
       });
     }
 
@@ -531,8 +570,8 @@ app.patch("/api/studios/:id", async (req, res) => {
     const updateData = {};
 
     for (const field of allowedFields) {
-      if (updates[field] !== undefined) {
-        updateData[field] = updates[field];
+      if (req.body[field] !== undefined) {
+        updateData[field] = req.body[field];
       }
     }
 
@@ -552,35 +591,40 @@ app.patch("/api/studios/:id", async (req, res) => {
       });
     }
 
-    if (
-      updateData.hourlyRate !== undefined &&
-      (!Number.isFinite(Number(updateData.hourlyRate)) ||
-        Number(updateData.hourlyRate) <= 0)
-    ) {
-      return res.status(400).json({
-        message: "Hourly rate must be greater than zero",
-      });
+    if (updateData.hourlyRate !== undefined) {
+      const rate = Number(updateData.hourlyRate);
+
+      if (!Number.isFinite(rate) || rate <= 0) {
+        return res.status(400).json({
+          message: "Hourly rate must be greater than zero",
+        });
+      }
+
+      updateData.hourlyRate = rate;
     }
 
-    if (
-      updateData.securityDeposit !== undefined &&
-      (!Number.isFinite(Number(updateData.securityDeposit)) ||
-        Number(updateData.securityDeposit) < 0)
-    ) {
-      return res.status(400).json({
-        message: "Security deposit cannot be negative",
-      });
+    if (updateData.securityDeposit !== undefined) {
+      const deposit = Number(updateData.securityDeposit);
+
+      if (!Number.isFinite(deposit) || deposit < 0) {
+        return res.status(400).json({
+          message: "Security deposit cannot be negative",
+        });
+      }
+
+      updateData.securityDeposit = deposit;
     }
 
-    if (
-      updateData.maxCapacity !== undefined &&
-      (!Number.isInteger(Number(updateData.maxCapacity)) ||
-        Number(updateData.maxCapacity) < 1)
-    ) {
-      return res.status(400).json({
-        message:
-          "Maximum capacity must be a positive integer",
-      });
+    if (updateData.maxCapacity !== undefined) {
+      const capacity = Number(updateData.maxCapacity);
+
+      if (!Number.isInteger(capacity) || capacity < 1) {
+        return res.status(400).json({
+          message: "Maximum capacity must be a positive integer",
+        });
+      }
+
+      updateData.maxCapacity = capacity;
     }
 
     updateData.updatedAt = new Date();
@@ -588,7 +632,7 @@ app.patch("/api/studios/:id", async (req, res) => {
     const result = await db.collection("studios").updateOne(
       {
         _id: new ObjectId(id),
-        ownerEmail: email,
+        ownerEmail: getUserEmail(req),
       },
       {
         $set: updateData,
@@ -597,8 +641,7 @@ app.patch("/api/studios/:id", async (req, res) => {
 
     if (result.matchedCount === 0) {
       return res.status(404).json({
-        message:
-          "Studio not found or you are not the owner",
+        message: "Studio not found or you are not the owner",
       });
     }
 
@@ -615,13 +658,12 @@ app.patch("/api/studios/:id", async (req, res) => {
 });
 
 // ======================================
-// 11. Delete Studio
+// 14. Delete Studio (Owner Only)
 // ======================================
 
-app.delete("/api/studios/:id", async (req, res) => {
+app.delete("/api/studios/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const email = normalizeEmail(req.body.ownerEmail);
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -629,21 +671,14 @@ app.delete("/api/studios/:id", async (req, res) => {
       });
     }
 
-    if (!email) {
-      return res.status(400).json({
-        message: "Owner email is required",
-      });
-    }
-
     const result = await db.collection("studios").deleteOne({
       _id: new ObjectId(id),
-      ownerEmail: email,
+      ownerEmail: getUserEmail(req),
     });
 
     if (result.deletedCount === 0) {
       return res.status(404).json({
-        message:
-          "Studio not found or you are not the owner",
+        message: "Studio not found or you are not the owner",
       });
     }
 
@@ -660,26 +695,17 @@ app.delete("/api/studios/:id", async (req, res) => {
 });
 
 // ======================================
-// 12. Get Owner Bookings
+// 15. Get Owner Bookings (Protected)
 // ======================================
 
-app.get("/api/owner-bookings", async (req, res) => {
+app.get("/api/owner-bookings", requireAuth, async (req, res) => {
   try {
-    const email = normalizeEmail(req.query.email);
-
-    if (!email) {
-      return res.status(400).json({
-        message: "Owner email is required",
-      });
-    }
-
     const studios = await db
       .collection("studios")
-      .find({ ownerEmail: email })
+      .find({ ownerEmail: getUserEmail(req) })
       .project({ _id: 1 })
       .toArray();
 
-    // Booking studioId is stored as String
     const studioIds = studios.map((studio) =>
       studio._id.toString()
     );
@@ -707,128 +733,116 @@ app.get("/api/owner-bookings", async (req, res) => {
 });
 
 // ======================================
-// 13. Owner Confirms or Rejects Booking
+// 16. Owner Confirms or Rejects Booking
 // ======================================
 
-app.patch("/api/bookings/:id/status", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const email = normalizeEmail(req.body.ownerEmail);
-    const { status } = req.body;
+app.patch(
+  "/api/bookings/:id/status",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        message: "Invalid booking ID",
-      });
-    }
-
-    if (!email) {
-      return res.status(400).json({
-        message: "Owner email is required",
-      });
-    }
-
-    if (!["Confirmed", "Rejected"].includes(status)) {
-      return res.status(400).json({
-        message: "Status must be Confirmed or Rejected",
-      });
-    }
-
-    const booking = await db.collection("bookings").findOne({
-      _id: new ObjectId(id),
-    });
-
-    if (!booking) {
-      return res.status(404).json({
-        message: "Booking not found",
-      });
-    }
-
-    if (!ObjectId.isValid(booking.studioId)) {
-      return res.status(400).json({
-        message: "Booking contains an invalid studio ID",
-      });
-    }
-
-    const studio = await db.collection("studios").findOne({
-      _id: new ObjectId(booking.studioId),
-      ownerEmail: email,
-    });
-
-    if (!studio) {
-      return res.status(403).json({
-        message: "You are not the owner of this studio",
-      });
-    }
-
-    const result = await db.collection("bookings").updateOne(
-      {
-        _id: new ObjectId(id),
-        status: "Pending",
-      },
-      {
-        $set: {
-          status,
-          updatedAt: new Date(),
-        },
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          message: "Invalid booking ID",
+        });
       }
-    );
 
-    if (result.matchedCount === 0) {
-      return res.status(409).json({
-        message: "Booking is no longer Pending",
+      if (!["Confirmed", "Rejected"].includes(status)) {
+        return res.status(400).json({
+          message: "Status must be Confirmed or Rejected",
+        });
+      }
+
+      const booking = await db.collection("bookings").findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!booking) {
+        return res.status(404).json({
+          message: "Booking not found",
+        });
+      }
+
+      if (!ObjectId.isValid(booking.studioId)) {
+        return res.status(400).json({
+          message: "Booking contains an invalid studio ID",
+        });
+      }
+
+      const studio = await db.collection("studios").findOne({
+        _id: new ObjectId(booking.studioId),
+        ownerEmail: getUserEmail(req),
+      });
+
+      if (!studio) {
+        return res.status(403).json({
+          message: "You are not the owner of this studio",
+        });
+      }
+
+      const result = await db.collection("bookings").updateOne(
+        {
+          _id: new ObjectId(id),
+          status: "Pending",
+        },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(409).json({
+          message: "Booking is no longer Pending",
+        });
+      }
+
+      await createNotification({
+        recipientEmail: booking.customerEmail,
+        title:
+          status === "Confirmed"
+            ? "Booking Confirmed"
+            : "Booking Rejected",
+        message:
+          status === "Confirmed"
+            ? `Your booking for ${booking.studioTitle} has been confirmed.`
+            : `Your booking for ${booking.studioTitle} has been rejected.`,
+        type:
+          status === "Confirmed"
+            ? "booking_confirmed"
+            : "booking_rejected",
+        bookingId: booking._id,
+        studioId: booking.studioId,
+      });
+
+      res.status(200).json({
+        message: `Booking ${status.toLowerCase()} successfully`,
+        status,
+      });
+    } catch (error) {
+      console.error("Update booking status error:", error);
+
+      res.status(500).json({
+        message: "Failed to update booking status",
       });
     }
-
-    // Notify Customer
-    await createNotification({
-      recipientEmail: booking.customerEmail,
-      title:
-        status === "Confirmed"
-          ? "Booking Confirmed"
-          : "Booking Rejected",
-      message:
-        status === "Confirmed"
-          ? `Your booking for ${booking.studioTitle} has been confirmed.`
-          : `Your booking for ${booking.studioTitle} has been rejected.`,
-      type:
-        status === "Confirmed"
-          ? "booking_confirmed"
-          : "booking_rejected",
-      bookingId: booking._id,
-      studioId: booking.studioId,
-    });
-
-    res.status(200).json({
-      message: `Booking ${status.toLowerCase()} successfully`,
-      status,
-    });
-  } catch (error) {
-    console.error("Update booking status error:", error);
-
-    res.status(500).json({
-      message: "Failed to update booking status",
-    });
   }
-});
+);
 
 // ======================================
-// 14. Get My Notifications
+// 17. Get My Notifications (Protected)
 // ======================================
 
-app.get("/api/notifications", async (req, res) => {
+app.get("/api/notifications", requireAuth, async (req, res) => {
   try {
-    const email = normalizeEmail(req.query.email);
-
-    if (!email) {
-      return res.status(400).json({
-        message: "User email is required",
-      });
-    }
-
     const notifications = await db
       .collection("notifications")
-      .find({ recipientEmail: email })
+      .find({ recipientEmail: getUserEmail(req) })
       .sort({ createdAt: -1 })
       .limit(50)
       .toArray();
@@ -844,99 +858,92 @@ app.get("/api/notifications", async (req, res) => {
 });
 
 // ======================================
-// 15. Mark Single Notification as Read
+// 18. Mark Single Notification as Read
 // ======================================
 
-app.patch("/api/notifications/:id/read", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const email = normalizeEmail(req.body.email);
+app.patch(
+  "/api/notifications/:id/read",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({
-        message: "Invalid notification ID",
-      });
-    }
-
-    if (!email) {
-      return res.status(400).json({
-        message: "User email is required",
-      });
-    }
-
-    const result = await db.collection("notifications").updateOne(
-      {
-        _id: new ObjectId(id),
-        recipientEmail: email,
-      },
-      {
-        $set: {
-          isRead: true,
-          readAt: new Date(),
-        },
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          message: "Invalid notification ID",
+        });
       }
-    );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
-        message: "Notification not found",
-      });
-    }
-
-    res.status(200).json({
-      message: "Notification marked as read",
-    });
-  } catch (error) {
-    console.error("Mark notification read error:", error);
-
-    res.status(500).json({
-      message: "Failed to update notification",
-    });
-  }
-});
-
-// ======================================
-// 16. Mark All Notifications as Read
-// ======================================
-
-app.patch("/api/notifications/read-all", async (req, res) => {
-  try {
-    const email = normalizeEmail(req.body.email);
-
-    if (!email) {
-      return res.status(400).json({
-        message: "User email is required",
-      });
-    }
-
-    const result = await db.collection("notifications").updateMany(
-      {
-        recipientEmail: email,
-        isRead: false,
-      },
-      {
-        $set: {
-          isRead: true,
-          readAt: new Date(),
+      const result = await db.collection("notifications").updateOne(
+        {
+          _id: new ObjectId(id),
+          recipientEmail: getUserEmail(req),
         },
+        {
+          $set: {
+            isRead: true,
+            readAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          message: "Notification not found",
+        });
       }
-    );
 
-    res.status(200).json({
-      message: "All notifications marked as read",
-      modifiedCount: result.modifiedCount,
-    });
-  } catch (error) {
-    console.error("Mark all notifications error:", error);
+      res.status(200).json({
+        message: "Notification marked as read",
+      });
+    } catch (error) {
+      console.error("Mark notification read error:", error);
 
-    res.status(500).json({
-      message: "Failed to update notifications",
-    });
+      res.status(500).json({
+        message: "Failed to update notification",
+      });
+    }
   }
-});
+);
 
 // ======================================
-// 17. Start Server
+// 19. Mark All Notifications as Read
+// ======================================
+
+app.patch(
+  "/api/notifications/read-all",
+  requireAuth,
+  async (req, res) => {
+    try {
+      const result = await db.collection("notifications").updateMany(
+        {
+          recipientEmail: getUserEmail(req),
+          isRead: false,
+        },
+        {
+          $set: {
+            isRead: true,
+            readAt: new Date(),
+          },
+        }
+      );
+
+      res.status(200).json({
+        message: "All notifications marked as read",
+        modifiedCount: result.modifiedCount,
+      });
+    } catch (error) {
+      console.error("Mark all notifications error:", error);
+
+      res.status(500).json({
+        message: "Failed to update notifications",
+      });
+    }
+  }
+);
+
+// ======================================
+// 20. Start Server
 // ======================================
 
 async function startServer() {

@@ -4,18 +4,23 @@ import "dotenv/config";
 const uri = process.env.MONGODB_URI;
 
 if (!uri) {
-  throw new Error("MONGODB_URI is missing from .env file");
+  throw new Error("MONGODB_URI is missing from .env");
 }
 
-const client = new MongoClient(uri);
+export const client = new MongoClient(uri);
+
+export const db = client.db("studiospace");
+
+let isConnected = false;
 
 export async function connectDB() {
   try {
-    await client.connect();
+    if (!isConnected) {
+      await client.connect();
+      isConnected = true;
 
-    const db = client.db("studiospace");
-
-    console.log("MongoDB connected successfully!");
+      console.log("MongoDB connected successfully!");
+    }
 
     return db;
   } catch (error) {
