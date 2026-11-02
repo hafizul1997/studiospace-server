@@ -14,6 +14,15 @@ app.use(express.json());
 let db;
 
 // ======================================
+// Helper: Normalize Email
+// ======================================
+
+const normalizeEmail = (email) => {
+  if (typeof email !== "string") return "";
+  return email.trim().toLowerCase();
+};
+
+// ======================================
 // 1. Test Route
 // ======================================
 
@@ -30,6 +39,7 @@ app.get("/api/studios", async (req, res) => {
     const studios = await db
       .collection("studios")
       .find()
+      .sort({ createdAt: -1 })
       .toArray();
 
     res.status(200).json(studios);
@@ -107,16 +117,36 @@ app.post("/api/studios", async (req, res) => {
   try {
     const studio = req.body;
 
-    if (!studio.title || !studio.category) {
+    if (
+      typeof studio.title !== "string" ||
+      !studio.title.trim() ||
+      typeof studio.category !== "string" ||
+      !studio.category.trim()
+    ) {
       return res.status(400).json({
         message: "Title and category are required",
       });
     }
 
-    const result = await db.collection("studios").insertOne({
+    const ownerEmail = normalizeEmail(studio.ownerEmail);
+
+    if (!ownerEmail) {
+      return res.status(400).json({
+        message: "Owner email is required",
+      });
+    }
+
+    const studioData = {
       ...studio,
+      title: studio.title.trim(),
+      category: studio.category.trim(),
+      ownerEmail,
       createdAt: new Date(),
-    });
+    };
+
+    const result = await db
+      .collection("studios")
+      .insertOne(studioData);
 
     res.status(201).json({
       message: "Studio created successfully",
@@ -132,7 +162,7 @@ app.post("/api/studios", async (req, res) => {
 });
 
 // ======================================
-// 6. Create New Booking (POST)
+// 6. Create New Booking
 // ======================================
 
 app.post("/api/bookings", async (req, res) => {
@@ -168,6 +198,15 @@ app.post("/api/bookings", async (req, res) => {
     if (!ObjectId.isValid(studioId)) {
       return res.status(400).json({
         message: "Invalid studio ID.",
+      });
+    }
+
+    // Validate email
+    const normalizedCustomerEmail = normalizeEmail(customerEmail);
+
+    if (!normalizedCustomerEmail) {
+      return res.status(400).json({
+        message: "Valid customer email is required.",
       });
     }
 
@@ -214,6 +253,15 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
+    if (
+      !Number.isFinite(Number(studio.hourlyRate)) ||
+      Number(studio.hourlyRate) <= 0
+    ) {
+      return res.status(400).json({
+        message: "Studio hourly rate is invalid.",
+      });
+    }
+
     // Calculate duration and price
     const [startHour, startMinute] = startTime.split(":").map(Number);
     const [endHour, endMinute] = endTime.split(":").map(Number);
@@ -226,9 +274,9 @@ app.post("/api/bookings", async (req, res) => {
 
     // Check overlapping bookings
     const overlappingBooking = await db.collection("bookings").findOne({
-      studioId,
+      studioId: String(studioId),
       bookingDate,
-      status: { $ne: "Cancelled" },
+      status: { $nin: ["Cancelled", "Rejected"] },
       startTime: { $lt: endTime },
       endTime: { $gt: startTime },
     });
@@ -241,10 +289,10 @@ app.post("/api/bookings", async (req, res) => {
 
     // Save booking
     const bookingData = {
-      studioId,
+      studioId: String(studioId),
       studioTitle: studio.title,
       customerName: customerName.trim(),
-      customerEmail: customerEmail.trim().toLowerCase(),
+      customerEmail: normalizedCustomerEmail,
       bookingDate,
       startTime,
       endTime,
@@ -261,7 +309,10 @@ app.post("/api/bookings", async (req, res) => {
     res.status(201).json({
       message: "Booking request submitted successfully!",
       bookingId: result.insertedId,
-      booking: bookingData,
+      booking: {
+        ...bookingData,
+        _id: result.insertedId,
+      },
     });
   } catch (error) {
     console.error("Create booking error:", error);
@@ -273,14 +324,15 @@ app.post("/api/bookings", async (req, res) => {
 });
 
 // ======================================
-// 7. Get My Bookings (GET)
+// 7. Get My Bookings
 // ======================================
 
 app.get("/api/my-bookings", async (req, res) => {
   try {
     const { email } = req.query;
+    const customerEmail = normalizeEmail(email);
 
-    if (!email || typeof email !== "string") {
+    if (!customerEmail) {
       return res.status(400).json({
         message: "Customer email is required.",
       });
@@ -289,7 +341,7 @@ app.get("/api/my-bookings", async (req, res) => {
     const bookings = await db
       .collection("bookings")
       .find({
-        customerEmail: email.trim().toLowerCase(),
+        customerEmail,
       })
       .sort({ createdAt: -1 })
       .toArray();
@@ -305,13 +357,13 @@ app.get("/api/my-bookings", async (req, res) => {
 });
 
 // ======================================
-// 8. Cancel Pending Booking (PATCH)
+// 8. Cancel Pending Booking
 // ======================================
 
 app.patch("/api/bookings/:id/cancel", async (req, res) => {
   try {
     const { id } = req.params;
-    const { email } = req.body;
+    const email = normalizeEmail(req.body.email);
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -319,7 +371,7 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
       });
     }
 
-    if (!email || typeof email !== "string") {
+    if (!email) {
       return res.status(400).json({
         message: "Customer email is required.",
       });
@@ -328,7 +380,7 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
     const result = await db.collection("bookings").updateOne(
       {
         _id: new ObjectId(id),
-        customerEmail: email.trim().toLowerCase(),
+        customerEmail: email,
         status: "Pending",
       },
       {
@@ -341,8 +393,7 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
 
     if (result.matchedCount === 0) {
       return res.status(404).json({
-        message:
-          "Booking not found, or booking cannot be cancelled.",
+        message: "Booking not found, or booking cannot be cancelled.",
       });
     }
 
@@ -357,10 +408,14 @@ app.patch("/api/bookings/:id/cancel", async (req, res) => {
     });
   }
 });
-// Get studios added by a specific owner
+
+// ======================================
+// 9. Get My Listings
+// ======================================
+
 app.get("/api/my-listings", async (req, res) => {
   try {
-    const email = req.query.email;
+    const email = normalizeEmail(req.query.email);
 
     if (!email) {
       return res.status(400).json({
@@ -371,7 +426,7 @@ app.get("/api/my-listings", async (req, res) => {
     const studios = await db
       .collection("studios")
       .find({
-        ownerEmail: email.toLowerCase().trim(),
+        ownerEmail: email,
       })
       .sort({ createdAt: -1 })
       .toArray();
@@ -385,8 +440,9 @@ app.get("/api/my-listings", async (req, res) => {
     });
   }
 });
+
 // ======================================
-// 9. Update Studio (PATCH)
+// 10. Update Studio
 // ======================================
 
 app.patch("/api/studios/:id", async (req, res) => {
@@ -394,19 +450,20 @@ app.patch("/api/studios/:id", async (req, res) => {
     const { id } = req.params;
     const { ownerEmail, ...updates } = req.body;
 
+    const email = normalizeEmail(ownerEmail);
+
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         message: "Invalid studio ID",
       });
     }
 
-    if (!ownerEmail || typeof ownerEmail !== "string") {
+    if (!email) {
       return res.status(400).json({
         message: "Owner email is required",
       });
     }
 
-    // Only allow these fields to be updated
     const allowedFields = [
       "title",
       "category",
@@ -433,12 +490,51 @@ app.patch("/api/studios/:id", async (req, res) => {
       });
     }
 
+    if (
+      updateData.title !== undefined &&
+      (typeof updateData.title !== "string" || !updateData.title.trim())
+    ) {
+      return res.status(400).json({
+        message: "Studio title is invalid",
+      });
+    }
+
+    if (
+      updateData.hourlyRate !== undefined &&
+      (!Number.isFinite(Number(updateData.hourlyRate)) ||
+        Number(updateData.hourlyRate) <= 0)
+    ) {
+      return res.status(400).json({
+        message: "Hourly rate must be greater than zero",
+      });
+    }
+
+    if (
+      updateData.securityDeposit !== undefined &&
+      (!Number.isFinite(Number(updateData.securityDeposit)) ||
+        Number(updateData.securityDeposit) < 0)
+    ) {
+      return res.status(400).json({
+        message: "Security deposit cannot be negative",
+      });
+    }
+
+    if (
+      updateData.maxCapacity !== undefined &&
+      (!Number.isInteger(Number(updateData.maxCapacity)) ||
+        Number(updateData.maxCapacity) < 1)
+    ) {
+      return res.status(400).json({
+        message: "Maximum capacity must be a positive integer",
+      });
+    }
+
     updateData.updatedAt = new Date();
 
     const result = await db.collection("studios").updateOne(
       {
         _id: new ObjectId(id),
-        ownerEmail: ownerEmail.trim().toLowerCase(),
+        ownerEmail: email,
       },
       {
         $set: updateData,
@@ -464,13 +560,13 @@ app.patch("/api/studios/:id", async (req, res) => {
 });
 
 // ======================================
-// 10. Delete Studio (DELETE)
+// 11. Delete Studio
 // ======================================
 
 app.delete("/api/studios/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { ownerEmail } = req.body;
+    const email = normalizeEmail(req.body.ownerEmail);
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -478,7 +574,7 @@ app.delete("/api/studios/:id", async (req, res) => {
       });
     }
 
-    if (!ownerEmail || typeof ownerEmail !== "string") {
+    if (!email) {
       return res.status(400).json({
         message: "Owner email is required",
       });
@@ -486,7 +582,7 @@ app.delete("/api/studios/:id", async (req, res) => {
 
     const result = await db.collection("studios").deleteOne({
       _id: new ObjectId(id),
-      ownerEmail: ownerEmail.trim().toLowerCase(),
+      ownerEmail: email,
     });
 
     if (result.deletedCount === 0) {
@@ -506,8 +602,143 @@ app.delete("/api/studios/:id", async (req, res) => {
     });
   }
 });
+
 // ======================================
-// 11. Start Server
+// 12. Get Owner Bookings
+// ======================================
+
+app.get("/api/owner-bookings", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email);
+
+    if (!email) {
+      return res.status(400).json({
+        message: "Owner email is required",
+      });
+    }
+
+    // Find studios belonging to this owner
+    const studios = await db
+      .collection("studios")
+      .find({
+        ownerEmail: email,
+      })
+      .project({ _id: 1 })
+      .toArray();
+
+    // Booking documents store studioId as String
+    const studioIds = studios.map((studio) =>
+      studio._id.toString()
+    );
+
+    if (studioIds.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    const bookings = await db
+      .collection("bookings")
+      .find({
+        studioId: { $in: studioIds },
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(bookings);
+  } catch (error) {
+    console.error("Owner bookings error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch owner bookings",
+    });
+  }
+});
+
+// ======================================
+// 13. Owner Confirms or Rejects Booking
+// ======================================
+
+app.patch("/api/bookings/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = normalizeEmail(req.body.ownerEmail);
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid booking ID",
+      });
+    }
+
+    if (!email) {
+      return res.status(400).json({
+        message: "Owner email is required",
+      });
+    }
+
+    if (!["Confirmed", "Rejected"].includes(status)) {
+      return res.status(400).json({
+        message: "Status must be Confirmed or Rejected",
+      });
+    }
+
+    // Find booking
+    const booking = await db.collection("bookings").findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        message: "Booking not found",
+      });
+    }
+
+    // Find the studio owned by this owner
+    const studio = await db.collection("studios").findOne({
+      _id: new ObjectId(booking.studioId),
+      ownerEmail: email,
+    });
+
+    if (!studio) {
+      return res.status(403).json({
+        message: "You are not the owner of this studio",
+      });
+    }
+
+    // Only Pending bookings can be changed
+    const result = await db.collection("bookings").updateOne(
+      {
+        _id: new ObjectId(id),
+        status: "Pending",
+      },
+      {
+        $set: {
+          status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(409).json({
+        message: "Booking is no longer Pending",
+      });
+    }
+
+    res.status(200).json({
+      message: `Booking ${status.toLowerCase()} successfully`,
+      status,
+    });
+  } catch (error) {
+    console.error("Update booking status error:", error);
+
+    res.status(500).json({
+      message: "Failed to update booking status",
+    });
+  }
+});
+
+// ======================================
+// 14. Start Server
 // ======================================
 
 async function startServer() {
