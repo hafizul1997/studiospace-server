@@ -994,49 +994,52 @@ app.get("/api/owner-bookings", requireAuth, async (req, res) => {
 });
 
 // ======================================
+// ============================================
 // 19. Owner Confirms or Rejects Booking
-// ======================================
+// ============================================
 
 app.patch("/api/bookings/:id/status", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    const { status } = req.body;
 
-    if (!isValidObjectId(id)) {
+    // 1. Validate booking ID
+    if (!ObjectId.isValid(id)) {
       return res.status(400).json({
+        success: false,
         message: "Invalid booking ID.",
       });
     }
 
-    if (!isPlainObject(req.body)) {
-      return res.status(400).json({
-        message: "Invalid request body.",
-      });
-    }
-
-    const { status } = req.body;
-
+    // 2. Validate requested status
     if (!["Confirmed", "Rejected"].includes(status)) {
       return res.status(400).json({
+        success: false,
         message: "Status must be Confirmed or Rejected.",
       });
     }
 
+    // 3. Find booking
     const booking = await db.collection("bookings").findOne({
       _id: new ObjectId(id),
     });
 
     if (!booking) {
       return res.status(404).json({
+        success: false,
         message: "Booking not found.",
       });
     }
 
-    if (!isValidObjectId(booking.studioId)) {
+    // 4. Validate studio ID
+    if (!ObjectId.isValid(booking.studioId)) {
       return res.status(400).json({
-        message: "Booking contains an invalid studio ID.",
+        success: false,
+        message: "Invalid studio ID in booking.",
       });
     }
 
+    // 5. Verify that the logged-in user owns this studio
     const studio = await db.collection("studios").findOne({
       _id: new ObjectId(booking.studioId),
       ownerEmail: getUserEmail(req),
@@ -1045,13 +1048,16 @@ app.patch("/api/bookings/:id/status", requireAuth, async (req, res) => {
 
     if (!studio) {
       return res.status(403).json({
-        message: "You are not the owner of this active studio.",
+        success: false,
+        message: "You are not authorized to update this booking.",
       });
     }
 
+    // 6. Update only if booking is still Pending
     const result = await db.collection("bookings").updateOne(
       {
         _id: new ObjectId(id),
+        studioId: booking.studioId,
         status: "Pending",
       },
       {
@@ -1062,36 +1068,43 @@ app.patch("/api/bookings/:id/status", requireAuth, async (req, res) => {
       }
     );
 
-    if (result.matchedCount === 0) {
+    if (result.modifiedCount === 0) {
       return res.status(409).json({
-        message: "Booking is no longer Pending.",
+        success: false,
+        message: "This booking has already been processed.",
       });
     }
 
-    await createNotification({
+    // 7. Create customer notification
+    await db.collection("notifications").insertOne({
       recipientEmail: booking.customerEmail,
-      title: status === "Confirmed"
-        ? "Booking Confirmed"
-        : "Booking Rejected",
-      message: status === "Confirmed"
-        ? `Your booking for ${booking.studioTitle} has been confirmed.`
-        : `Your booking for ${booking.studioTitle} has been rejected.`,
-      type: status === "Confirmed"
-        ? "booking_confirmed"
-        : "booking_rejected",
-      bookingId: booking._id,
+      title: `Booking ${status}`,
+      message:
+        status === "Confirmed"
+          ? `Your booking for ${studio.studioName || "the studio"} has been confirmed.`
+          : `Your booking for ${studio.studioName || "the studio"} has been rejected.`,
+      type: "booking",
+      bookingId: id,
       studioId: booking.studioId,
+      isRead: false,
+      createdAt: new Date(),
     });
 
-    res.status(200).json({
+    // 8. Send response
+    return res.status(200).json({
+      success: true,
       message: `Booking ${status.toLowerCase()} successfully.`,
       status,
     });
   } catch (error) {
-    sendServerError(res, "Failed to update booking status.", error);
+    console.error("Update Booking Status Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+    });
   }
 });
-
 // ======================================
 // 20. Get My Notifications (Protected)
 // ======================================
