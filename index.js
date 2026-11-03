@@ -9,9 +9,15 @@ import { auth } from "./auth.js";
 import { fromNodeHeaders } from "better-auth/node";
 
 const app = express();
-const PORT = process.env.PORT || 5000;
 
+const PORT = Number(process.env.PORT) || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+
+let db;
+
+// ======================================
+// 1. Security Configuration
+// ======================================
 
 app.disable("x-powered-by");
 
@@ -26,20 +32,34 @@ app.use(
 
 app.use(express.json({ limit: "100kb" }));
 
-let db;
+// Reject unexpected content types for JSON API requests.
+// GET requests without a body are not affected.
+app.use((req, res, next) => {
+  if (
+    ["POST", "PATCH", "PUT"].includes(req.method) &&
+    req.path.startsWith("/api/") &&
+    req.headers["content-type"] &&
+    !req.is("application/json")
+  ) {
+    return res.status(415).json({
+      success: false,
+      message: "Content-Type must be application/json.",
+    });
+  }
+
+  next();
+});
 
 // ======================================
-// 1. Constants
+// 2. Constants
 // ======================================
 
 const STUDIO_CATEGORIES = [
-  "Photography Studio",
-  "Music Studio",
-  "Podcast Studio",
-  "Video Studio",
-  "Event Space",
-  "Creative Workspace",
-  "Other",
+  "Photo Studio",
+  "Film Stage",
+  "Podcast Lounge",
+  "Music Suite",
+  "Workshop",
 ];
 
 const BOOKING_STATUSES = [
@@ -54,9 +74,102 @@ const MAX_DESCRIPTION_LENGTH = 3000;
 const MAX_LOCATION_LENGTH = 200;
 const MAX_AMENITIES = 30;
 const MAX_AMENITY_LENGTH = 60;
+const MAX_IMAGE_URL_LENGTH = 2048;
+
+const BOOKING_LOCK_DURATION = 30000;
 
 // ======================================
-// 2. Authentication Middleware
+// 3. General Helpers
+// ======================================
+
+const normalizeEmail = (email) =>
+  typeof email === "string" ? email.trim().toLowerCase() : "";
+
+const getUserEmail = (req) => normalizeEmail(req.user?.email);
+
+const isPlainObject = (value) =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value);
+
+const hasOwn = (object, key) =>
+  Object.prototype.hasOwnProperty.call(object, key);
+
+const isValidObjectId = (id) =>
+  typeof id === "string" && /^[a-fA-F0-9]{24}$/.test(id);
+
+const isValidString = (value, maxLength) =>
+  typeof value === "string" &&
+  value.trim().length > 0 &&
+  value.trim().length <= maxLength;
+
+const parsePositiveNumber = (value) => {
+  if (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    typeof value === "boolean"
+  ) {
+    return NaN;
+  }
+
+  return Number(value);
+};
+
+const isValidDate = (value) => {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(value)
+  ) {
+    return false;
+  }
+
+  const date = new Date(`${value}T00:00:00.000Z`);
+
+  return (
+    !Number.isNaN(date.getTime()) &&
+    date.toISOString().slice(0, 10) === value
+  );
+};
+
+const isValidTime = (value) =>
+  typeof value === "string" &&
+  /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+
+const isValidImageUrl = (value) => {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.length > MAX_IMAGE_URL_LENGTH
+  ) {
+    return false;
+  }
+
+  try {
+    const url = new URL(value);
+
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+};
+
+const sendServerError = (res, message, error) => {
+  console.error(message, error);
+
+  return res.status(500).json({
+    success: false,
+    message: "An unexpected server error occurred.",
+  });
+};
+
+const getDateTimeMinutes = (time) => {
+  const [hours, minutes] = time.split(":").map(Number);
+  return hours * 60 + minutes;
+};
+
+// ======================================
+// 4. Authentication Middleware
 // ======================================
 
 const requireAuth = async (req, res, next) => {
@@ -65,7 +178,7 @@ const requireAuth = async (req, res, next) => {
       headers: fromNodeHeaders(req.headers),
     });
 
-    if (!session?.user || !session?.user?.email) {
+    if (!session?.user?.id || !session?.user?.email) {
       return res.status(401).json({
         success: false,
         message: "Unauthorized. Please login first.",
@@ -87,77 +200,104 @@ const requireAuth = async (req, res, next) => {
 };
 
 // ======================================
-// 3. Helper Functions
+// 5. Studio Validation
 // ======================================
 
-const normalizeEmail = (email) =>
-  typeof email === "string" ? email.trim().toLowerCase() : "";
+const validateStudioFields = (data, isCreate = false) => {
+  const errors = [];
 
-const getUserEmail = (req) => normalizeEmail(req.user?.email);
-
-const isValidObjectId = (id) =>
-  typeof id === "string" && ObjectId.isValid(id);
-
-const isValidString = (value, maxLength) =>
-  typeof value === "string" &&
-  value.trim().length > 0 &&
-  value.trim().length <= maxLength;
-
-const isValidDate = (value) => {
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    return false;
+  if (!isPlainObject(data)) {
+    return ["Request body must be a valid JSON object."];
   }
 
-  const date = new Date(`${value}T00:00:00.000Z`);
-
-  return (
-    !Number.isNaN(date.getTime()) &&
-    date.toISOString().slice(0, 10) === value
-  );
-};
-
-const isValidTime = (value) =>
-  typeof value === "string" &&
-  /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
-
-const isValidImageUrl = (value) => {
-  if (typeof value !== "string" || value.length > 2048) {
-    return false;
+  if (isCreate || hasOwn(data, "title")) {
+    if (!isValidString(data.title, MAX_TITLE_LENGTH)) {
+      errors.push("Title is required and must be under 120 characters.");
+    }
   }
 
-  try {
-    const url = new URL(value);
-
-    return ["http:", "https:"].includes(url.protocol);
-  } catch {
-    return false;
-  }
-};
-
-const parsePositiveNumber = (value) => {
-  if (
-    value === null ||
-    value === undefined ||
-    value === "" ||
-    typeof value === "boolean"
-  ) {
-    return NaN;
+  if (isCreate || hasOwn(data, "category")) {
+    if (
+      typeof data.category !== "string" ||
+      !STUDIO_CATEGORIES.includes(data.category.trim())
+    ) {
+      errors.push("Please select a valid studio category.");
+    }
   }
 
-  return Number(value);
-};
+  if (isCreate || hasOwn(data, "hourlyRate")) {
+    const rate = parsePositiveNumber(data.hourlyRate);
 
-const sendServerError = (res, message, error) => {
-  console.error(message, error);
+    if (!Number.isFinite(rate) || rate <= 0 || rate > 1000000) {
+      errors.push("Hourly rate must be greater than 0.");
+    }
+  }
 
-  return res.status(500).json({
-    success: false,
-    message,
-  });
+  if (isCreate || hasOwn(data, "securityDeposit")) {
+    const deposit = parsePositiveNumber(data.securityDeposit);
+
+    if (
+      !Number.isFinite(deposit) ||
+      deposit < 0 ||
+      deposit > 10000000
+    ) {
+      errors.push("Security deposit must be 0 or greater.");
+    }
+  }
+
+  if (isCreate || hasOwn(data, "maxCapacity")) {
+    const capacity = parsePositiveNumber(data.maxCapacity);
+
+    if (
+      !Number.isInteger(capacity) ||
+      capacity < 1 ||
+      capacity > 10000
+    ) {
+      errors.push("Maximum capacity must be a positive integer.");
+    }
+  }
+
+  if (isCreate || hasOwn(data, "location")) {
+    if (!isValidString(data.location, MAX_LOCATION_LENGTH)) {
+      errors.push("Location is required and must be under 200 characters.");
+    }
+  }
+
+  if (isCreate || hasOwn(data, "imageUrl")) {
+    if (!isValidImageUrl(data.imageUrl)) {
+      errors.push("Please provide a valid HTTP or HTTPS image URL.");
+    }
+  }
+
+  if (isCreate || hasOwn(data, "description")) {
+    if (
+      typeof data.description !== "string" ||
+      data.description.trim().length > MAX_DESCRIPTION_LENGTH
+    ) {
+      errors.push("Description must be under 3000 characters.");
+    }
+  }
+
+  if (isCreate || hasOwn(data, "amenities")) {
+    if (
+      !Array.isArray(data.amenities) ||
+      data.amenities.length > MAX_AMENITIES ||
+      !data.amenities.every(
+        (item) =>
+          typeof item === "string" &&
+          item.trim().length > 0 &&
+          item.trim().length <= MAX_AMENITY_LENGTH
+      )
+    ) {
+      errors.push("Amenities must be a valid list of up to 30 items.");
+    }
+  }
+
+  return errors;
 };
 
 // ======================================
-// 4. Notification Helper
+// 6. Notification Helper
 // ======================================
 
 const createNotification = async ({
@@ -192,136 +332,12 @@ const createNotification = async ({
 };
 
 // ======================================
-// 5. Studio Input Validation
-// ======================================
-
-const validateStudioFields = (data, isCreate = false) => {
-  const errors = [];
-
-  if (
-    isCreate ||
-    Object.prototype.hasOwnProperty.call(data, "title")
-  ) {
-    if (!isValidString(data.title, MAX_TITLE_LENGTH)) {
-      errors.push("Title is required and must be under 120 characters.");
-    }
-  }
-
-  if (
-    isCreate ||
-    Object.prototype.hasOwnProperty.call(data, "category")
-  ) {
-    if (
-      typeof data.category !== "string" ||
-      !STUDIO_CATEGORIES.includes(data.category.trim())
-    ) {
-      errors.push("Please select a valid studio category.");
-    }
-  }
-
-  if (
-    isCreate ||
-    Object.prototype.hasOwnProperty.call(data, "hourlyRate")
-  ) {
-    const rate = parsePositiveNumber(data.hourlyRate);
-
-    if (!Number.isFinite(rate) || rate <= 0 || rate > 1000000) {
-      errors.push("Hourly rate must be greater than 0.");
-    }
-  }
-
-  if (
-    isCreate ||
-    Object.prototype.hasOwnProperty.call(data, "securityDeposit")
-  ) {
-    const deposit = parsePositiveNumber(data.securityDeposit);
-
-    if (
-      !Number.isFinite(deposit) ||
-      deposit < 0 ||
-      deposit > 10000000
-    ) {
-      errors.push("Security deposit must be 0 or greater.");
-    }
-  }
-
-  if (
-    isCreate ||
-    Object.prototype.hasOwnProperty.call(data, "maxCapacity")
-  ) {
-    const capacity = parsePositiveNumber(data.maxCapacity);
-
-    if (
-      !Number.isInteger(capacity) ||
-      capacity < 1 ||
-      capacity > 10000
-    ) {
-      errors.push("Maximum capacity must be a positive integer.");
-    }
-  }
-
-  if (
-    isCreate ||
-    Object.prototype.hasOwnProperty.call(data, "location")
-  ) {
-    if (!isValidString(data.location, MAX_LOCATION_LENGTH)) {
-      errors.push("Location is required and must be under 200 characters.");
-    }
-  }
-
-  if (
-    Object.prototype.hasOwnProperty.call(data, "imageUrl") ||
-    isCreate
-  ) {
-    if (!isValidImageUrl(data.imageUrl)) {
-      errors.push("Please provide a valid HTTP or HTTPS image URL.");
-    }
-  }
-
-  if (
-    Object.prototype.hasOwnProperty.call(data, "description") ||
-    isCreate
-  ) {
-    if (
-      typeof data.description !== "string" ||
-      data.description.trim().length > MAX_DESCRIPTION_LENGTH
-    ) {
-      errors.push("Description must be under 3000 characters.");
-    }
-  }
-
-  if (
-    Object.prototype.hasOwnProperty.call(data, "amenities") ||
-    isCreate
-  ) {
-    if (
-      !Array.isArray(data.amenities) ||
-      data.amenities.length > MAX_AMENITIES ||
-      !data.amenities.every(
-        (item) =>
-          typeof item === "string" &&
-          item.trim().length > 0 &&
-          item.trim().length <= MAX_AMENITY_LENGTH
-      )
-    ) {
-      errors.push("Amenities must be a valid list of up to 30 items.");
-    }
-  }
-
-  return errors;
-};
-
-// ======================================
-// 6. Test Route
+// 7. Basic Routes
 // ======================================
 
 app.get("/", (req, res) => {
-  res.send("StudioSpace Server is Running!");
+  res.status(200).send("StudioSpace Server is Running!");
 });
-
-// ======================================
-// 7. Authentication Check
-// ======================================
 
 app.get("/api/auth-check", requireAuth, (req, res) => {
   res.status(200).json({
@@ -413,6 +429,7 @@ app.post("/api/studios", requireAuth, async (req, res) => {
 
     if (errors.length > 0) {
       return res.status(400).json({
+        success: false,
         message: "Invalid studio information.",
         errors,
       });
@@ -431,7 +448,8 @@ app.post("/api/studios", requireAuth, async (req, res) => {
       amenities: studio.amenities.map((item) => item.trim()),
       description: studio.description.trim(),
 
-      // Owner identity comes only from authenticated session.
+      // Never trust owner information from the frontend.
+      ownerId: req.user.id,
       ownerName: req.user.name || "",
       ownerEmail: getUserEmail(req),
 
@@ -440,16 +458,15 @@ app.post("/api/studios", requireAuth, async (req, res) => {
       updatedAt: new Date(),
     };
 
-    const result = await db
-      .collection("studios")
-      .insertOne(studioData);
+    const result = await db.collection("studios").insertOne(studioData);
 
-    res.status(201).json({
+    return res.status(201).json({
+      success: true,
       message: "Studio created successfully.",
       insertedId: result.insertedId,
     });
   } catch (error) {
-    sendServerError(res, "Failed to create studio.", error);
+    return sendServerError(res, "Failed to create studio.", error);
   }
 });
 
@@ -462,6 +479,12 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
   let studioObjectId;
 
   try {
+    if (!isPlainObject(req.body)) {
+      return res.status(400).json({
+        message: "Invalid request body.",
+      });
+    }
+
     const {
       studioId,
       bookingDate,
@@ -498,6 +521,7 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       });
     }
 
+    // This booking system does not support overnight bookings.
     if (startTime >= endTime) {
       return res.status(400).json({
         message: "End time must be later than start time.",
@@ -514,13 +538,17 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       });
     }
 
-    const customerEmail = getUserEmail(req);
+    // Compare booking date using server UTC date.
+    // Configure the server timezone/business timezone consistently.
+    const today = new Date().toISOString().slice(0, 10);
 
-    if (!customerEmail) {
-      return res.status(401).json({
-        message: "Authenticated email is unavailable.",
+    if (bookingDate < today) {
+      return res.status(400).json({
+        message: "You cannot book a date in the past.",
       });
     }
+
+    const customerEmail = getUserEmail(req);
 
     studioObjectId = new ObjectId(studioId);
 
@@ -532,6 +560,12 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
     if (!studio) {
       return res.status(404).json({
         message: "Studio not found.",
+      });
+    }
+
+    if (studio.ownerEmail === customerEmail) {
+      return res.status(403).json({
+        message: "You cannot book your own studio.",
       });
     }
 
@@ -549,12 +583,10 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       });
     }
 
-    const [startHour, startMinute] = startTime.split(":").map(Number);
-    const [endHour, endMinute] = endTime.split(":").map(Number);
+    const startMinutes = getDateTimeMinutes(startTime);
+    const endMinutes = getDateTimeMinutes(endTime);
 
-    const totalHours =
-      (endHour * 60 + endMinute - (startHour * 60 + startMinute)) / 60;
-
+    const totalHours = (endMinutes - startMinutes) / 60;
     const totalPrice = totalHours * hourlyRate;
 
     if (!Number.isFinite(totalPrice) || totalPrice <= 0) {
@@ -563,8 +595,7 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       });
     }
 
-    // Atomic per-studio lock prevents two requests from checking
-    // availability and inserting at the same time.
+    // Acquire a per-studio temporary lock.
     lockToken = randomUUID();
 
     const lockResult = await db.collection("studios").updateOne(
@@ -579,26 +610,27 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       {
         $set: {
           bookingLockToken: lockToken,
-          bookingLockUntil: new Date(Date.now() + 30000),
+          bookingLockUntil: new Date(
+            Date.now() + BOOKING_LOCK_DURATION
+          ),
         },
       }
     );
 
     if (lockResult.modifiedCount !== 1) {
       return res.status(409).json({
-        message: "This studio is currently processing another booking. Please try again.",
+        message: "This studio is processing another booking. Please try again.",
       });
     }
 
-    const overlappingBooking = await db
-      .collection("bookings")
-      .findOne({
-        studioId: String(studioId),
-        bookingDate,
-        status: { $in: ["Pending", "Confirmed"] },
-        startTime: { $lt: endTime },
-        endTime: { $gt: startTime },
-      });
+    // Check time overlap.
+    const overlappingBooking = await db.collection("bookings").findOne({
+      studioId: String(studioId),
+      bookingDate,
+      status: { $in: ["Pending", "Confirmed"] },
+      startTime: { $lt: endTime },
+      endTime: { $gt: startTime },
+    });
 
     if (overlappingBooking) {
       return res.status(409).json({
@@ -609,6 +641,7 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
     const bookingData = {
       studioId: String(studioId),
       studioTitle: studio.title,
+      customerId: req.user.id,
       customerName: req.user.name || "",
       customerEmail,
       bookingDate,
@@ -623,9 +656,7 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       updatedAt: new Date(),
     };
 
-    const result = await db
-      .collection("bookings")
-      .insertOne(bookingData);
+    const result = await db.collection("bookings").insertOne(bookingData);
 
     await createNotification({
       recipientEmail: studio.ownerEmail,
@@ -636,7 +667,8 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       studioId: studio._id,
     });
 
-    res.status(201).json({
+    return res.status(201).json({
+      success: true,
       message: "Booking request submitted successfully!",
       bookingId: result.insertedId,
       booking: {
@@ -645,9 +677,9 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
       },
     });
   } catch (error) {
-    sendServerError(res, "Failed to create booking.", error);
+    return sendServerError(res, "Failed to create booking.", error);
   } finally {
-    // Release only the lock created by this request.
+    // Release only this request's lock.
     if (lockToken && studioObjectId) {
       try {
         await db.collection("studios").updateOne(
@@ -675,8 +707,7 @@ app.post("/api/bookings", requireAuth, async (req, res) => {
 
 app.get("/api/my-bookings", requireAuth, async (req, res) => {
   try {
-    const bookings = await db
-      .collection("bookings")
+    const bookings = await db.collection("bookings")
       .find({ customerEmail: getUserEmail(req) })
       .sort({ createdAt: -1 })
       .toArray();
@@ -691,47 +722,43 @@ app.get("/api/my-bookings", requireAuth, async (req, res) => {
 // 14. Cancel Pending Booking (Protected)
 // ======================================
 
-app.patch(
-  "/api/bookings/:id/cancel",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
+app.patch("/api/bookings/:id/cancel", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-      if (!isValidObjectId(id)) {
-        return res.status(400).json({
-          message: "Invalid booking ID.",
-        });
-      }
-
-      const result = await db.collection("bookings").updateOne(
-        {
-          _id: new ObjectId(id),
-          customerEmail: getUserEmail(req),
-          status: "Pending",
-        },
-        {
-          $set: {
-            status: "Cancelled",
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      if (result.matchedCount === 0) {
-        return res.status(404).json({
-          message: "Booking not found, or booking cannot be cancelled.",
-        });
-      }
-
-      res.status(200).json({
-        message: "Booking cancelled successfully!",
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({
+        message: "Invalid booking ID.",
       });
-    } catch (error) {
-      sendServerError(res, "Failed to cancel booking.", error);
     }
+
+    const result = await db.collection("bookings").updateOne(
+      {
+        _id: new ObjectId(id),
+        customerEmail: getUserEmail(req),
+        status: "Pending",
+      },
+      {
+        $set: {
+          status: "Cancelled",
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "Booking not found, or booking cannot be cancelled.",
+      });
+    }
+
+    res.status(200).json({
+      message: "Booking cancelled successfully!",
+    });
+  } catch (error) {
+    sendServerError(res, "Failed to cancel booking.", error);
   }
-);
+});
 
 // ======================================
 // 15. Get My Listings (Protected)
@@ -739,8 +766,7 @@ app.patch(
 
 app.get("/api/my-listings", requireAuth, async (req, res) => {
   try {
-    const studios = await db
-      .collection("studios")
+    const studios = await db.collection("studios")
       .find({
         ownerEmail: getUserEmail(req),
         isDeleted: { $ne: true },
@@ -768,6 +794,12 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
       });
     }
 
+    if (!isPlainObject(req.body)) {
+      return res.status(400).json({
+        message: "Invalid request body.",
+      });
+    }
+
     const allowedFields = [
       "title",
       "category",
@@ -783,7 +815,7 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
     const updateData = {};
 
     for (const field of allowedFields) {
-      if (req.body[field] !== undefined) {
+      if (hasOwn(req.body, field)) {
         updateData[field] = req.body[field];
       }
     }
@@ -803,7 +835,6 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
       });
     }
 
-    // Normalize values before saving.
     if (updateData.title !== undefined) {
       updateData.title = updateData.title.trim();
     }
@@ -837,7 +868,9 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
     }
 
     if (updateData.amenities !== undefined) {
-      updateData.amenities = updateData.amenities.map((item) => item.trim());
+      updateData.amenities = updateData.amenities.map((item) =>
+        item.trim()
+      );
     }
 
     updateData.updatedAt = new Date();
@@ -869,7 +902,6 @@ app.patch("/api/studios/:id", requireAuth, async (req, res) => {
 
 // ======================================
 // 17. Delete Studio (Owner Only)
-// Soft Delete: preserve booking history.
 // ======================================
 
 app.delete("/api/studios/:id", requireAuth, async (req, res) => {
@@ -897,10 +929,6 @@ app.delete("/api/studios/:id", requireAuth, async (req, res) => {
           deletedAt: new Date(),
           updatedAt: new Date(),
         },
-        $unset: {
-          bookingLockToken: "",
-          bookingLockUntil: "",
-        },
       }
     );
 
@@ -910,8 +938,7 @@ app.delete("/api/studios/:id", requireAuth, async (req, res) => {
       });
     }
 
-    // Cancel pending requests so the deleted studio cannot
-    // receive new booking confirmations.
+    // Cancel pending bookings for this studio.
     await db.collection("bookings").updateMany(
       {
         studioId: String(studioId),
@@ -940,8 +967,7 @@ app.delete("/api/studios/:id", requireAuth, async (req, res) => {
 
 app.get("/api/owner-bookings", requireAuth, async (req, res) => {
   try {
-    const studios = await db
-      .collection("studios")
+    const studios = await db.collection("studios")
       .find({
         ownerEmail: getUserEmail(req),
       })
@@ -954,8 +980,7 @@ app.get("/api/owner-bookings", requireAuth, async (req, res) => {
       return res.status(200).json([]);
     }
 
-    const bookings = await db
-      .collection("bookings")
+    const bookings = await db.collection("bookings")
       .find({
         studioId: { $in: studioIds },
       })
@@ -972,101 +997,100 @@ app.get("/api/owner-bookings", requireAuth, async (req, res) => {
 // 19. Owner Confirms or Rejects Booking
 // ======================================
 
-app.patch(
-  "/api/bookings/:id/status",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { status } = req.body;
+app.patch("/api/bookings/:id/status", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-      if (!isValidObjectId(id)) {
-        return res.status(400).json({
-          message: "Invalid booking ID.",
-        });
-      }
-
-      if (!["Confirmed", "Rejected"].includes(status)) {
-        return res.status(400).json({
-          message: "Status must be Confirmed or Rejected.",
-        });
-      }
-
-      const booking = await db.collection("bookings").findOne({
-        _id: new ObjectId(id),
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({
+        message: "Invalid booking ID.",
       });
-
-      if (!booking) {
-        return res.status(404).json({
-          message: "Booking not found.",
-        });
-      }
-
-      if (!isValidObjectId(booking.studioId)) {
-        return res.status(400).json({
-          message: "Booking contains an invalid studio ID.",
-        });
-      }
-
-      const studio = await db.collection("studios").findOne({
-        _id: new ObjectId(booking.studioId),
-        ownerEmail: getUserEmail(req),
-        isDeleted: { $ne: true },
-      });
-
-      if (!studio) {
-        return res.status(403).json({
-          message: "You are not the owner of this active studio.",
-        });
-      }
-
-      // Conditional update prevents changing an already processed booking.
-      const result = await db.collection("bookings").updateOne(
-        {
-          _id: new ObjectId(id),
-          status: "Pending",
-        },
-        {
-          $set: {
-            status,
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      if (result.matchedCount === 0) {
-        return res.status(409).json({
-          message: "Booking is no longer Pending.",
-        });
-      }
-
-      await createNotification({
-        recipientEmail: booking.customerEmail,
-        title:
-          status === "Confirmed"
-            ? "Booking Confirmed"
-            : "Booking Rejected",
-        message:
-          status === "Confirmed"
-            ? `Your booking for ${booking.studioTitle} has been confirmed.`
-            : `Your booking for ${booking.studioTitle} has been rejected.`,
-        type:
-          status === "Confirmed"
-            ? "booking_confirmed"
-            : "booking_rejected",
-        bookingId: booking._id,
-        studioId: booking.studioId,
-      });
-
-      res.status(200).json({
-        message: `Booking ${status.toLowerCase()} successfully.`,
-        status,
-      });
-    } catch (error) {
-      sendServerError(res, "Failed to update booking status.", error);
     }
+
+    if (!isPlainObject(req.body)) {
+      return res.status(400).json({
+        message: "Invalid request body.",
+      });
+    }
+
+    const { status } = req.body;
+
+    if (!["Confirmed", "Rejected"].includes(status)) {
+      return res.status(400).json({
+        message: "Status must be Confirmed or Rejected.",
+      });
+    }
+
+    const booking = await db.collection("bookings").findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        message: "Booking not found.",
+      });
+    }
+
+    if (!isValidObjectId(booking.studioId)) {
+      return res.status(400).json({
+        message: "Booking contains an invalid studio ID.",
+      });
+    }
+
+    const studio = await db.collection("studios").findOne({
+      _id: new ObjectId(booking.studioId),
+      ownerEmail: getUserEmail(req),
+      isDeleted: { $ne: true },
+    });
+
+    if (!studio) {
+      return res.status(403).json({
+        message: "You are not the owner of this active studio.",
+      });
+    }
+
+    const result = await db.collection("bookings").updateOne(
+      {
+        _id: new ObjectId(id),
+        status: "Pending",
+      },
+      {
+        $set: {
+          status,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(409).json({
+        message: "Booking is no longer Pending.",
+      });
+    }
+
+    await createNotification({
+      recipientEmail: booking.customerEmail,
+      title: status === "Confirmed"
+        ? "Booking Confirmed"
+        : "Booking Rejected",
+      message: status === "Confirmed"
+        ? `Your booking for ${booking.studioTitle} has been confirmed.`
+        : `Your booking for ${booking.studioTitle} has been rejected.`,
+      type: status === "Confirmed"
+        ? "booking_confirmed"
+        : "booking_rejected",
+      bookingId: booking._id,
+      studioId: booking.studioId,
+    });
+
+    res.status(200).json({
+      message: `Booking ${status.toLowerCase()} successfully.`,
+      status,
+    });
+  } catch (error) {
+    sendServerError(res, "Failed to update booking status.", error);
   }
-);
+});
 
 // ======================================
 // 20. Get My Notifications (Protected)
@@ -1074,9 +1098,10 @@ app.patch(
 
 app.get("/api/notifications", requireAuth, async (req, res) => {
   try {
-    const notifications = await db
-      .collection("notifications")
-      .find({ recipientEmail: getUserEmail(req) })
+    const notifications = await db.collection("notifications")
+      .find({
+        recipientEmail: getUserEmail(req),
+      })
       .sort({ createdAt: -1 })
       .limit(50)
       .toArray();
@@ -1091,86 +1116,90 @@ app.get("/api/notifications", requireAuth, async (req, res) => {
 // 21. Mark Single Notification as Read
 // ======================================
 
-app.patch(
-  "/api/notifications/:id/read",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
+app.patch("/api/notifications/:id/read", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-      if (!isValidObjectId(id)) {
-        return res.status(400).json({
-          message: "Invalid notification ID.",
-        });
-      }
-
-      const result = await db.collection("notifications").updateOne(
-        {
-          _id: new ObjectId(id),
-          recipientEmail: getUserEmail(req),
-        },
-        {
-          $set: {
-            isRead: true,
-            readAt: new Date(),
-          },
-        }
-      );
-
-      if (result.matchedCount === 0) {
-        return res.status(404).json({
-          message: "Notification not found.",
-        });
-      }
-
-      res.status(200).json({
-        message: "Notification marked as read.",
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({
+        message: "Invalid notification ID.",
       });
-    } catch (error) {
-      sendServerError(res, "Failed to update notification.", error);
     }
+
+    const result = await db.collection("notifications").updateOne(
+      {
+        _id: new ObjectId(id),
+        recipientEmail: getUserEmail(req),
+      },
+      {
+        $set: {
+          isRead: true,
+          readAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "Notification not found.",
+      });
+    }
+
+    res.status(200).json({
+      message: "Notification marked as read.",
+    });
+  } catch (error) {
+    sendServerError(res, "Failed to update notification.", error);
   }
-);
+});
 
 // ======================================
 // 22. Mark All Notifications as Read
 // ======================================
 
-app.patch(
-  "/api/notifications/read-all",
-  requireAuth,
-  async (req, res) => {
-    try {
-      const result = await db.collection("notifications").updateMany(
-        {
-          recipientEmail: getUserEmail(req),
-          isRead: false,
+app.patch("/api/notifications/read-all", requireAuth, async (req, res) => {
+  try {
+    const result = await db.collection("notifications").updateMany(
+      {
+        recipientEmail: getUserEmail(req),
+        isRead: false,
+      },
+      {
+        $set: {
+          isRead: true,
+          readAt: new Date(),
         },
-        {
-          $set: {
-            isRead: true,
-            readAt: new Date(),
-          },
-        }
-      );
+      }
+    );
 
-      res.status(200).json({
-        message: "All notifications marked as read.",
-        modifiedCount: result.modifiedCount,
-      });
-    } catch (error) {
-      sendServerError(res, "Failed to update notifications.", error);
-    }
+    res.status(200).json({
+      message: "All notifications marked as read.",
+      modifiedCount: result.modifiedCount,
+    });
+  } catch (error) {
+    sendServerError(res, "Failed to update notifications.", error);
   }
-);
+});
 
 // ======================================
-// 23. JSON Error Handler
+// 23. Not Found Handler
+// ======================================
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "API route not found.",
+  });
+});
+
+// ======================================
+// 24. Error Handler
 // ======================================
 
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
     return res.status(400).json({
+      success: false,
       message: "Invalid JSON request body.",
     });
   }
@@ -1178,16 +1207,25 @@ app.use((err, req, res, next) => {
   console.error("Unhandled server error:", err);
 
   return res.status(500).json({
+    success: false,
     message: "Internal server error.",
   });
 });
 
 // ======================================
-// 24. Start Server
+// 25. Start Server
 // ======================================
 
 async function startServer() {
   try {
+    if (!process.env.BETTER_AUTH_SECRET) {
+      throw new Error("BETTER_AUTH_SECRET is missing.");
+    }
+
+    if (!process.env.MONGODB_URI) {
+      throw new Error("MONGODB_URI is missing.");
+    }
+
     db = await connectDB();
 
     app.listen(PORT, () => {
