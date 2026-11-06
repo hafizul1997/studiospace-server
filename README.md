@@ -67,10 +67,17 @@ npm install
 
 Create a `.env` file in the project root.
 
-```env
-PORT=5000
-MONGODB_URI=YOUR_MONGODB_CONNECTION_STRING
-```
+
+**Note:**
+- `PORT`: Backend server port.
+- `MONGODB_URI`: MongoDB Atlas connection string.
+- `BETTER_AUTH_SECRET`: Secret key used by Better Auth.
+- `CLIENT_URL`: Frontend application URL.
+
+For production deployment, update `CLIENT_URL` with your deployed frontend URL.
+
+Never share your actual `.env` file or secret values publicly.
+
 
 Configure any additional Better Auth and Google OAuth environment variables required by your backend code.
 
