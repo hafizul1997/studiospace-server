@@ -36,8 +36,11 @@ StudioSpace is a creative studio booking platform. This repository contains the 
 ```text
 studiospace-server/
 ├── index.js
+├── db.js
+├── auth.js
 ├── package.json
 ├── .env
+├── .gitignore
 └── README.md
 ```
 
