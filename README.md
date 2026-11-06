@@ -88,6 +88,61 @@ http://localhost:5000
 
 ## 🔗 API Overview
 
+## 🔗 API Documentation
+
+Base URL:
+
+```text
+https://studiospace-server-xxwa.onrender.com
+```
+
+### Public Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/` | Check server status |
+| GET | `/api/studios` | Get all studios |
+| GET | `/api/featured-studios` | Get featured studios |
+| GET | `/api/studios/:id` | Get studio details |
+
+### Protected Endpoints
+
+These endpoints require an authenticated user session.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/auth-check` | Verify user authentication |
+| POST | `/api/studios` | Create a new studio |
+| PATCH | `/api/studios/:id` | Update a studio |
+| DELETE | `/api/studios/:id` | Delete a studio |
+| GET | `/api/my-listings` | Get owner's studio listings |
+| POST | `/api/bookings` | Create a booking request |
+| GET | `/api/my-bookings` | Get customer's bookings |
+| PATCH | `/api/bookings/:id/cancel` | Cancel a pending booking |
+| GET | `/api/owner-bookings` | Get owner's bookings |
+| PATCH | `/api/bookings/:id/status` | Confirm or reject a booking |
+| GET | `/api/notifications` | Get user notifications |
+| PATCH | `/api/notifications/:id/read` | Mark a notification as read |
+| PATCH | `/api/notifications/read-all` | Mark all notifications as read |
+
+### Booking Status
+
+- Pending
+- Confirmed
+- Rejected
+- Cancelled
+
+### Studio Categories
+
+- Photo Studio
+- Film Stage
+- Podcast Lounge
+- Music Suite
+- Workshop
+
+
+
+
 The backend provides API operations for:
 
 - Studio listings
